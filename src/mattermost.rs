@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::channel::RawMessage;
+use crate::channel::{InboundFile, OutboundFile, RawMessage};
 
 /// Mattermost's default maximum post length in characters.
 const MAX_TEXT_CHARS: usize = 16_383;
@@ -31,6 +31,14 @@ const DONE_EMOJI: &str = "white_check_mark";
 const FAILED_EMOJI: &str = "x";
 /// Upper bound on remembered active threads; the oldest are pruned past this.
 const MAX_ACTIVE_THREADS: i64 = 500;
+/// Largest attachment Push will download or upload.
+const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
+/// Attachment extensions Push accepts; anything else is ignored on the way in.
+const ALLOWED_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "csv", "tsv", "json", "yaml", "yml", "toml", "xml", "log", "pdf",
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "rs", "py", "js", "ts", "tsx", "jsx", "go", "java",
+    "c", "cc", "cpp", "h", "hpp", "sh", "bash", "html", "css", "sql", "ini", "conf", "env",
+];
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Writer = SplitSink<Socket, Message>;
@@ -85,6 +93,7 @@ struct Event {
     user: String,
     text: String,
     root: String,
+    files: Vec<crate::channel::InboundFile>,
     /// True when the bot user is in the event's `mentions` list.
     is_mention: bool,
     is_from_me: bool,
@@ -113,6 +122,25 @@ struct Post {
     root_id: String,
     #[serde(default, rename = "type")]
     kind: String,
+    #[serde(default)]
+    metadata: PostMetadata,
+}
+
+#[derive(Default, Deserialize)]
+struct PostMetadata {
+    #[serde(default)]
+    files: Vec<FileInfo>,
+}
+
+#[derive(Deserialize)]
+struct FileInfo {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mime_type: String,
+    #[serde(default)]
+    size: Option<usize>,
 }
 
 impl Drop for ReceiverTask {
@@ -298,6 +326,56 @@ impl Mattermost {
         self.state.reacted.lock().unwrap().remove(post_id);
     }
 
+    /// Downloads an attachment's bytes, refusing anything over the size cap.
+    pub async fn download_file(&self, file: &InboundFile) -> Result<Vec<u8>> {
+        if file.size.is_some_and(|size| size > MAX_FILE_BYTES) {
+            bail!("Mattermost attachment {:?} exceeds the size limit", file.filename);
+        }
+        let url = format!("{}/api/v4/files/{}", self.state.base_url, file.locator);
+        let response = self
+            .state
+            .client
+            .get(&url)
+            .bearer_auth(&self.state.token)
+            .send()
+            .await
+            .context("download Mattermost attachment")?;
+        if !response.status().is_success() {
+            bail!(
+                "Mattermost file download returned HTTP {}",
+                response.status().as_u16()
+            );
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("read Mattermost attachment bytes")?;
+        if bytes.len() > MAX_FILE_BYTES {
+            bail!("Mattermost attachment {:?} exceeds the size limit", file.filename);
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// Uploads agent-produced files and posts them to the target thread.
+    pub async fn send_files(&self, target: &str, files: &[OutboundFile]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let (channel_id, root) = self.resolve_target(target).await?;
+        let mut file_ids = Vec::with_capacity(files.len());
+        for file in files {
+            file_ids.push(self.state.upload_file(&channel_id, file).await?);
+        }
+        let mut body = json!({"channel_id": channel_id, "message": "", "file_ids": file_ids});
+        if let Some(root) = root {
+            body.as_object_mut()
+                .expect("Mattermost post payload is an object")
+                .insert("root_id".to_string(), Value::String(root));
+        }
+        self.state.api_post("/api/v4/posts", body).await?;
+        Ok(())
+    }
+
     async fn resolve_target(&self, target: &str) -> Result<(String, Option<String>)> {
         if let Some((channel, root)) = parse_reply_target(target) {
             return Ok((channel.to_string(), Some(root.to_string())));
@@ -355,6 +433,35 @@ impl State {
         let url = format!("{}{path}", self.base_url);
         self.send_retrying(path, || self.client.delete(&url).bearer_auth(&self.token))
             .await
+    }
+
+    /// Uploads one file to a channel and returns its new Mattermost file id.
+    async fn upload_file(&self, channel_id: &str, file: &OutboundFile) -> Result<String> {
+        if file.bytes.len() > MAX_FILE_BYTES {
+            bail!("Mattermost upload {:?} exceeds the size limit", file.filename);
+        }
+        let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+            .file_name(file.filename.clone());
+        let form = reqwest::multipart::Form::new()
+            .text("channel_id", channel_id.to_string())
+            .part("files", part);
+        let response = self
+            .client
+            .post(format!("{}/api/v4/files", self.base_url))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .context("upload Mattermost file")?;
+        let value = self.decode("/api/v4/files", response).await?;
+        value
+            .get("file_infos")
+            .and_then(Value::as_array)
+            .and_then(|infos| infos.first())
+            .and_then(|info| info.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("Mattermost file upload omitted a file id")
     }
 
     /// Sends a request, retrying once after Mattermost's `Retry-After` on a 429.
@@ -597,6 +704,7 @@ impl Inbox {
                 text TEXT NOT NULL,
                 root_id TEXT NOT NULL,
                 channel_type TEXT NOT NULL DEFAULT 'D',
+                files TEXT NOT NULL DEFAULT '[]',
                 is_group INTEGER NOT NULL,
                 is_from_me INTEGER NOT NULL,
                 is_supported INTEGER NOT NULL
@@ -607,10 +715,14 @@ impl Inbox {
                 PRIMARY KEY (channel_id, root_id)
             );",
         )?;
-        // Add channel_type to inboxes created before channel support. A
+        // Add columns to inboxes created before channel and file support. A
         // duplicate-column error means the migration already ran.
         let _ = connection.execute(
             "ALTER TABLE mattermost_events ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'D'",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE mattermost_events ADD COLUMN files TEXT NOT NULL DEFAULT '[]'",
             [],
         );
         Ok(Self {
@@ -620,11 +732,12 @@ impl Inbox {
     }
 
     fn insert(&mut self, event: &Event) -> Result<i64> {
+        let files = serde_json::to_string(&event.files).unwrap_or_else(|_| "[]".to_string());
         self.connection.execute(
             "INSERT INTO mattermost_events (
                 event_id, channel_id, user_id, text, root_id,
-                channel_type, is_group, is_from_me, is_supported
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                channel_type, files, is_group, is_from_me, is_supported
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(event_id) DO NOTHING",
             params![
                 event.event_id,
@@ -633,6 +746,7 @@ impl Inbox {
                 event.text,
                 event.root,
                 event.channel_type,
+                files,
                 false,
                 event.is_from_me,
                 event.is_supported,
@@ -658,7 +772,7 @@ impl Inbox {
     fn after(&self, since: i64) -> Result<Vec<RawMessage>> {
         let mut statement = self.connection.prepare(
             "SELECT id, event_id, channel_id, user_id, text, root_id,
-                    channel_type, is_from_me, is_supported
+                    channel_type, files, is_from_me, is_supported
              FROM mattermost_events WHERE id > ?1 ORDER BY id",
         )?;
         let rows = statement
@@ -666,6 +780,8 @@ impl Inbox {
                 let channel: String = row.get(2)?;
                 let root: String = row.get(5)?;
                 let channel_type: String = row.get(6)?;
+                let files: String = row.get(7)?;
+                let files = serde_json::from_str(&files).unwrap_or_default();
                 Ok(RawMessage {
                     row_id: row.get(0)?,
                     provider_event_id: Some(row.get(1)?),
@@ -675,8 +791,9 @@ impl Inbox {
                     is_group: false,
                     text: row.get(4)?,
                     voice: None,
-                    is_from_me: row.get(7)?,
-                    is_supported: row.get(8)?,
+                    files,
+                    is_from_me: row.get(8)?,
+                    is_supported: row.get(9)?,
                     thread_id: None,
                 })
             })?
@@ -749,10 +866,30 @@ fn parse_event(data: &Value, identity: &Identity) -> Option<Event> {
     let is_from_me = post.user_id == identity.user_id;
     // Strip the bot's own @mention so the agent receives the plain request.
     let text = strip_mention(&post.message, &identity.username);
+    let files: Vec<crate::channel::InboundFile> = post
+        .metadata
+        .files
+        .into_iter()
+        .filter_map(|file| {
+            let name = if file.name.is_empty() {
+                file.id.clone()
+            } else {
+                file.name
+            };
+            is_allowed_file(&name).then_some(crate::channel::InboundFile {
+                locator: file.id,
+                filename: name,
+                mime_type: file.mime_type,
+                size: file.size,
+            })
+        })
+        .collect();
+    // A message is in scope if it carries text or at least one accepted file.
+    let has_content = !text.trim().is_empty() || !files.is_empty();
     let is_supported = post.kind.is_empty()
         && !post.channel_id.is_empty()
         && !post.user_id.is_empty()
-        && !text.trim().is_empty()
+        && has_content
         && !root.is_empty();
     Some(Event {
         event_id: post.id,
@@ -761,9 +898,18 @@ fn parse_event(data: &Value, identity: &Identity) -> Option<Event> {
         user: post.user_id,
         text,
         root,
+        files,
         is_mention,
         is_from_me,
         is_supported,
+    })
+}
+
+/// Accepts a filename whose extension is in the download whitelist.
+fn is_allowed_file(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ext)| {
+        let ext = ext.to_ascii_lowercase();
+        ALLOWED_EXTENSIONS.contains(&ext.as_str())
     })
 }
 
@@ -1015,6 +1161,7 @@ mod tests {
             is_group: false,
             text: event.text.clone(),
             voice: None,
+            files: event.files.clone(),
             is_from_me: event.is_from_me,
             is_supported: event.is_supported,
             thread_id: None,
@@ -1180,6 +1327,117 @@ mod tests {
             "DELETE /api/v4/users/UBOT/posts/p9/reactions/hourglass_flowing_sand"
         ));
         assert!(lines[2].starts_with("POST /api/v4/reactions"));
+    }
+
+    #[test]
+    fn whitelists_attachments_by_extension() {
+        assert!(is_allowed_file("report.md"));
+        assert!(is_allowed_file("IMAGE.PNG"));
+        assert!(is_allowed_file("a.b.pdf"));
+        assert!(!is_allowed_file("malware.exe"));
+        assert!(!is_allowed_file("noextension"));
+        assert!(!is_allowed_file("archive.zip"));
+    }
+
+    #[test]
+    fn parses_whitelisted_attachments_and_supports_file_only_posts() {
+        let post = json!({
+            "id": "p1", "channel_id": "D1", "user_id": "U1", "message": "",
+            "metadata": {"files": [
+                {"id": "f1", "name": "report.md", "mime_type": "text/markdown", "size": 10},
+                {"id": "f2", "name": "virus.exe", "mime_type": "application/x-dosexec", "size": 5}
+            ]}
+        });
+        let event = parse_event(&data(post, "D"), &identity()).unwrap();
+        assert_eq!(event.files.len(), 1);
+        assert_eq!(event.files[0].filename, "report.md");
+        assert_eq!(event.files[0].locator, "f1");
+        // A file-only message (no text) is in scope thanks to the attachment.
+        assert!(event.is_supported);
+    }
+
+    #[tokio::test]
+    async fn downloads_attachment_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            let line = String::from_utf8_lossy(&buffer[..read])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
+                .await
+                .unwrap();
+            line
+        });
+
+        let mm = Mattermost::with_inbox(
+            format!("http://{address}"),
+            "token".to_string(),
+            vec!["U1".to_string()],
+            temp_path("mattermost-dl").to_str().unwrap(),
+        )
+        .unwrap();
+        let file = InboundFile {
+            locator: "f1".to_string(),
+            filename: "report.md".to_string(),
+            mime_type: "text/markdown".to_string(),
+            size: Some(5),
+        };
+
+        let bytes = mm.download_file(&file).await.unwrap();
+        assert_eq!(bytes, b"hello");
+        assert!(server.await.unwrap().starts_with("GET /api/v4/files/f1"));
+    }
+
+    #[tokio::test]
+    async fn uploads_files_then_posts_them_to_the_thread() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in [r#"{"file_infos":[{"id":"newid"}]}"#, r#"{"id":"p1"}"#] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 2048];
+                let read = stream.read(&mut buffer).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let mm = Mattermost::with_inbox(
+            format!("http://{address}"),
+            "token".to_string(),
+            vec!["U1".to_string()],
+            temp_path("mattermost-ul").to_str().unwrap(),
+        )
+        .unwrap();
+        let files = [OutboundFile {
+            filename: "out.md".to_string(),
+            bytes: b"data".to_vec(),
+        }];
+
+        mm.send_files("C1|root1", &files).await.unwrap();
+
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("POST /api/v4/files"));
+        assert!(requests[1].starts_with("POST /api/v4/posts"));
+        assert!(requests[1].contains("newid"));
+        assert!(requests[1].contains("root1"));
     }
 
     #[tokio::test]

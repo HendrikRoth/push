@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::approval::AnswerOrigin;
 use crate::config::{ChannelKind, Config};
@@ -26,6 +27,23 @@ pub struct InboundVoice {
     pub data: Option<Vec<u8>>,
 }
 
+/// A file attachment the sender posted, to be downloaded into the run workdir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboundFile {
+    /// Channel-owned file identifier, treated as opaque by the gateway.
+    pub locator: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: Option<usize>,
+}
+
+/// A file the agent produced, to be uploaded as a reply attachment.
+#[derive(Debug, Clone)]
+pub struct OutboundFile {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RawMessage {
     pub row_id: i64,
@@ -38,6 +56,8 @@ pub struct RawMessage {
     pub is_group: bool,
     pub text: String,
     pub voice: Option<InboundVoice>,
+    /// Whitelisted file attachments accompanying the message.
+    pub files: Vec<InboundFile>,
     pub is_from_me: bool,
     pub is_supported: bool,
     /// Channel-specific thread/topic id (Telegram `message_thread_id`).
@@ -116,6 +136,17 @@ trait ChannelContract {
 
     async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip>;
     async fn send_voice(&self, target: &str, clip: &AudioClip) -> Result<()>;
+
+    /// Downloads an inbound attachment's bytes. Default: unsupported.
+    async fn download_file(&self, _file: &InboundFile) -> Result<Vec<u8>> {
+        bail!("file attachments are not supported on this channel")
+    }
+
+    /// Uploads agent-produced files as a reply attachment. Default: no-op so a
+    /// stray attach marker on a channel without file support is simply dropped.
+    async fn send_files(&self, _target: &str, _files: &[OutboundFile]) -> Result<()> {
+        Ok(())
+    }
 
     fn delivery_semantics(&self) -> DeliverySemantics {
         DeliverySemantics {
@@ -363,6 +394,26 @@ impl Channel {
         }
     }
 
+    pub async fn download_file(&self, file: &InboundFile) -> Result<Vec<u8>> {
+        match self {
+            Self::IMessage(channel) => ChannelContract::download_file(channel, file).await,
+            Self::Telegram(channel) => ChannelContract::download_file(channel, file).await,
+            Self::Slack(channel) => ChannelContract::download_file(channel, file).await,
+            Self::Mattermost(channel) => ChannelContract::download_file(channel, file).await,
+        }
+    }
+
+    pub async fn send_files(&self, target: &str, files: &[OutboundFile]) -> Result<()> {
+        match self {
+            Self::IMessage(channel) => ChannelContract::send_files(channel, target, files).await,
+            Self::Telegram(channel) => ChannelContract::send_files(channel, target, files).await,
+            Self::Slack(channel) => ChannelContract::send_files(channel, target, files).await,
+            Self::Mattermost(channel) => {
+                ChannelContract::send_files(channel, target, files).await
+            }
+        }
+    }
+
     pub fn delivery_semantics(&self) -> DeliverySemantics {
         match self {
             Self::IMessage(channel) => ChannelContract::delivery_semantics(channel),
@@ -417,6 +468,7 @@ impl ChannelContract for IMessageChannel {
                 is_group: message.is_group,
                 text: message.text,
                 voice: None,
+                files: Vec::new(),
                 is_from_me: message.is_from_me,
                 is_supported: true,
                 thread_id: None,
@@ -860,6 +912,14 @@ impl ChannelContract for Mattermost {
     async fn send_voice(&self, _target: &str, _clip: &AudioClip) -> Result<()> {
         bail!("Mattermost voice replies are not supported")
     }
+
+    async fn download_file(&self, file: &InboundFile) -> Result<Vec<u8>> {
+        self.download_file(file).await
+    }
+
+    async fn send_files(&self, target: &str, files: &[OutboundFile]) -> Result<()> {
+        self.send_files(target, files).await
+    }
 }
 
 fn common_reject_reason(message: &RawMessage) -> Option<&'static str> {
@@ -867,7 +927,8 @@ fn common_reject_reason(message: &RawMessage) -> Option<&'static str> {
         Some("unsupported_update")
     } else if message.is_group {
         Some("group_chat")
-    } else if message.text.trim().is_empty() && message.voice.is_none() {
+    } else if message.text.trim().is_empty() && message.voice.is_none() && message.files.is_empty()
+    {
         Some("empty_message")
     } else {
         None
@@ -962,6 +1023,7 @@ mod tests {
             is_group: false,
             text: "hello".to_string(),
             voice: None,
+            files: Vec::new(),
             is_from_me,
             is_supported: true,
             thread_id: None,
@@ -978,6 +1040,7 @@ mod tests {
             is_group,
             text: "hello".to_string(),
             voice: None,
+            files: Vec::new(),
             is_from_me: false,
             is_supported: true,
             thread_id: None,
@@ -1073,6 +1136,7 @@ mod tests {
             is_group: false,
             text: "hello".to_string(),
             voice: None,
+            files: Vec::new(),
             is_from_me: false,
             is_supported: true,
             thread_id: None,

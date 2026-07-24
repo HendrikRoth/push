@@ -160,6 +160,7 @@ fn msg(chat: &str, handle: &str, from_me: bool, text: &str) -> RawMessage {
         chat_identifier: chat.to_string(),
         text: text.to_string(),
         voice: None,
+        files: Vec::new(),
         is_from_me: from_me,
         is_group: false,
         is_supported: true,
@@ -243,6 +244,7 @@ fn setup_failure_job(row_id: i64) -> Job {
         text: "hello".to_string(),
         reply_with_voice: false,
         voice_attachment: None,
+        files: Vec::new(),
     }
 }
 
@@ -1745,6 +1747,7 @@ async fn closed_worker_queue_is_recovered_without_another_message() {
         text: "recover older".to_string(),
         reply_with_voice: false,
         voice_attachment: None,
+        files: Vec::new(),
     };
 
     let (jobs, rx) = mpsc::channel(QUEUE_DEPTH);
@@ -2033,6 +2036,7 @@ async fn stop_targets_the_current_row_ahead_of_retained_failures() {
         text: text.to_string(),
         reply_with_voice: false,
         voice_attachment: None,
+        files: Vec::new(),
     };
     let inbound_ids = ["failed", "active", "/stop"]
         .into_iter()
@@ -2864,6 +2868,7 @@ fn message(row_id: i64, chat: &str, handle: &str, is_from_me: bool, text: &str) 
         chat_identifier: chat.to_string(),
         text: text.to_string(),
         voice: None,
+        files: Vec::new(),
         is_from_me,
         is_group: false,
         is_supported: true,
@@ -2886,6 +2891,7 @@ fn telegram_message(
         chat_identifier: chat_id.to_string(),
         text: text.to_string(),
         voice: None,
+        files: Vec::new(),
         is_from_me: false,
         is_group,
         is_supported: true,

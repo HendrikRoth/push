@@ -21,7 +21,7 @@ use crate::agent::Runner;
 use crate::approval::AnswerOrigin;
 use crate::approval::AnswerOutcome;
 use crate::audit::{AuditEvent, AuditLog};
-use crate::channel::{Channel, InboundVoice, RawMessage};
+use crate::channel::{Channel, InboundFile, InboundVoice, RawMessage};
 use crate::config::{AgentBackend, ChannelKind, Config, PrimaryDeliveryConfig};
 use crate::history::{History, OutboundOrigin};
 use crate::jobs;
@@ -44,6 +44,7 @@ struct Job {
     text: String,
     reply_with_voice: bool,
     voice_attachment: Option<InboundVoice>,
+    files: Vec<InboundFile>,
 }
 
 /// Shared, cheaply cloneable context handed to each worker task.
@@ -533,6 +534,8 @@ impl Gateway {
                 let reply_with_voice = m.voice.is_some();
                 let message_text = if reply_with_voice {
                     "[Voice message]".to_string()
+                } else if m.text.trim().is_empty() && !m.files.is_empty() {
+                    "[File attachment]".to_string()
                 } else {
                     m.text.trim().to_string()
                 };
@@ -657,6 +660,7 @@ impl Gateway {
                     text: message_text,
                     reply_with_voice,
                     voice_attachment: m.voice.clone(),
+                    files: m.files.clone(),
                 };
                 if job.text.trim().eq_ignore_ascii_case("/stop") {
                     if !self.stop(job).await {

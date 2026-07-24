@@ -122,6 +122,30 @@ Push posts a top-level message to that channel. The bot must be a member of the
 channel. A channel target is not checked against `allow_user_ids` — it is an
 operator-configured destination, so restrict who can edit the config.
 
+## File attachments
+
+**Inbound.** When an accepted message carries file attachments, Push downloads
+each one whose extension is on the allow list (text, code, CSV/JSON/YAML/TOML,
+Markdown, PDF, and common image types) into an `inbox/` folder in the run's
+working directory, up to 10 files and 20 MB each. A note listing their relative
+paths (`inbox/<name>`) is appended to the prompt. Push never edits the files
+itself — the agent decides, from your message, whether and how to use them. An
+`inbox/.gitignore` keeps the downloads out of the assistant's git repository.
+Non-whitelisted attachments are ignored, and a message that is only an
+attachment (no text) is still processed.
+
+**Outbound.** The agent can return a file by writing it into the working
+directory and emitting an attach marker in its reply:
+
+```
+Here is the report. [[attach: report.md]]
+```
+
+Push removes every `[[attach: <path>]]` marker from the delivered text, reads
+the named files (paths must stay inside the working directory), uploads them,
+and posts them to the same thread. For the agent to use this, tell it about the
+marker in your assistant instructions (`SOUL.md`).
+
 ## Linux and service mode
 
 Mattermost mode works on Linux or a VM because it does not depend on the macOS
