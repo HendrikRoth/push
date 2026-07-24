@@ -422,6 +422,9 @@ where
             let delivery = deliver_stored(ctx, &job, &outbound).await;
             if delivery.is_ok() {
                 info!("[{}] reply sent via {}", job.thread, ctx.channel.id());
+                if let Err(e) = ctx.channel.finish_activity(&job.target, true).await {
+                    warn!("[{}] {} activity finish failed: {e}", job.thread, ctx.channel.id());
+                }
             }
             report_delivery(
                 ctx,
@@ -600,6 +603,11 @@ async fn finish_run_with_gateway_reply(ctx: &Ctx, job: &Job, reply: &str, labels
         labels.completion,
         labels.deliver,
     );
+    // A failed, timed-out, or interrupted run still clears its in-progress
+    // signal, marking the message as not successfully answered.
+    if let Err(e) = ctx.channel.finish_activity(&job.target, false).await {
+        warn!("[{}] {} activity finish failed: {e}", job.thread, ctx.channel.id());
+    }
 }
 
 /// Audits `reply_sent` and completes the row when the reply reached the

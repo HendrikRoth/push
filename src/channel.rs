@@ -107,6 +107,13 @@ trait ChannelContract {
         Ok(())
     }
 
+    /// Called once a run has finished, letting a channel clear any in-progress
+    /// signal. `delivered` is true when the reply reached the channel, false on
+    /// timeout, failure, or interruption. Best-effort; the default does nothing.
+    async fn finish_activity(&self, _target: &str, _delivered: bool) -> Result<()> {
+        Ok(())
+    }
+
     async fn download_voice(&self, voice: &InboundVoice) -> Result<AudioClip>;
     async fn send_voice(&self, target: &str, clip: &AudioClip) -> Result<()>;
 
@@ -315,6 +322,23 @@ impl Channel {
             Self::Telegram(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Slack(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Mattermost(channel) => ChannelContract::send_typing(channel, target).await,
+        }
+    }
+
+    pub async fn finish_activity(&self, target: &str, delivered: bool) -> Result<()> {
+        match self {
+            Self::IMessage(channel) => {
+                ChannelContract::finish_activity(channel, target, delivered).await
+            }
+            Self::Telegram(channel) => {
+                ChannelContract::finish_activity(channel, target, delivered).await
+            }
+            Self::Slack(channel) => {
+                ChannelContract::finish_activity(channel, target, delivered).await
+            }
+            Self::Mattermost(channel) => {
+                ChannelContract::finish_activity(channel, target, delivered).await
+            }
         }
     }
 
@@ -725,14 +749,23 @@ impl ChannelContract for Mattermost {
     }
 
     fn primary_target(&self, configured: &str) -> Result<String> {
-        let user = configured.trim();
-        if user.is_empty() {
+        let configured = configured.trim();
+        if configured.is_empty() {
             bail!("primary delivery target cannot be empty");
         }
-        if !self.allows_user(user) {
-            bail!("Mattermost primary user {user:?} is not in mattermost.allow_user_ids");
+        // A "channel:<id>" target posts a top-level message to that channel; the
+        // bot must be a member. Everything else is an allowlisted user DM.
+        if let Some(channel) = configured.strip_prefix("channel:") {
+            let channel = channel.trim();
+            if channel.is_empty() {
+                bail!("Mattermost primary channel id cannot be empty");
+            }
+            return Ok(format!("channel:{channel}"));
         }
-        Ok(format!("user:{user}"))
+        if !self.allows_user(configured) {
+            bail!("Mattermost primary user {configured:?} is not in mattermost.allow_user_ids");
+        }
+        Ok(format!("user:{configured}"))
     }
 
     async fn poll(&self, since: i64) -> Result<Vec<RawMessage>> {
@@ -750,8 +783,19 @@ impl ChannelContract for Mattermost {
         {
             return None;
         }
-        let (channel, root) = crate::mattermost::parse_message_target(&message.chat_identifier)?;
-        Some((format!("mattermost:dm:{channel}"), format!("{channel}|{root}")))
+        let (channel_type, channel, root) =
+            crate::mattermost::parse_message_target(&message.chat_identifier)?;
+        // A direct message is one conversation per channel. Every other channel
+        // type keeps each thread as its own session and carries the triggering
+        // post id so the working signal can react to that exact message.
+        if channel_type == "D" {
+            return Some((format!("mattermost:dm:{channel}"), format!("{channel}|{root}")));
+        }
+        let post_id = message.provider_event_id.as_deref().unwrap_or(root);
+        Some((
+            format!("mattermost:ch:{channel}:{root}"),
+            format!("{channel}|{root}|{post_id}"),
+        ))
     }
 
     fn reject_reason(&self, message: &RawMessage) -> &'static str {
@@ -766,7 +810,7 @@ impl ChannelContract for Mattermost {
 
     fn approval_origin(&self, message: &RawMessage, thread: &str) -> AnswerOrigin {
         let chat_key = crate::mattermost::parse_message_target(&message.chat_identifier)
-            .map(|(channel, _)| channel)
+            .map(|(_, channel, _)| channel)
             .unwrap_or(&message.chat_identifier);
         AnswerOrigin {
             channel: self.id().to_string(),
@@ -802,6 +846,11 @@ impl ChannelContract for Mattermost {
 
     async fn send_typing(&self, target: &str) -> Result<()> {
         self.send_typing(target).await
+    }
+
+    async fn finish_activity(&self, target: &str, delivered: bool) -> Result<()> {
+        self.finish_working(target, delivered).await;
+        Ok(())
     }
 
     async fn download_voice(&self, _voice: &InboundVoice) -> Result<AudioClip> {

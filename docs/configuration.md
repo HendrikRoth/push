@@ -158,6 +158,8 @@ provider does not stop the other.
 must be enabled and the target must appear in that channel's allowlist.
 Telegram topic targets use `"<chat-id>:<topic-id>"`.
 Slack primary targets use an allowlisted member ID such as `U012ABCDEF`.
+Mattermost primary targets use an allowlisted user ID for a DM, or
+`"channel:<channel-id>"` to post in a channel the bot has joined.
 
 ## Routing
 
@@ -187,6 +189,8 @@ Thread keys are:
 - `telegram:dm:<chat-id>`
 - `telegram:dm:<chat-id>:topic:<topic-id>`
 - `slack:dm:<workspace-id>:<dm-channel-id>`
+- `mattermost:dm:<channel-id>`
+- `mattermost:ch:<channel-id>:<root-id>`
 
 ## Agent permissions
 
