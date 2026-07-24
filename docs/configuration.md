@@ -102,6 +102,19 @@ Slack requires both `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, or the matching
 `slack.app_token` and `slack.bot_token` values in the private config. At least
 one exact Slack member ID is required. See the [Slack guide](slack.md).
 
+### Mattermost
+
+```toml
+[mattermost]
+url = "https://mattermost.example.com"
+token = "bot-access-token"
+allow_user_ids = ["replace-with-a-26-char-mattermost-user-id"]
+```
+
+Mattermost requires `mattermost.url` (your server) and a bot access token in
+`mattermost.token` or the `MATTERMOST_TOKEN` environment variable. At least one
+exact Mattermost user ID is required. See the [Mattermost guide](mattermost.md).
+
 Telegram voice notes are optional. Configure the shared voice provider with:
 
 ```toml

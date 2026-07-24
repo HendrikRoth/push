@@ -16,6 +16,7 @@ mod history;
 mod imessage;
 mod jobs;
 mod markdown;
+mod mattermost;
 mod pi;
 mod rehydration;
 mod restart;

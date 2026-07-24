@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use crate::approval::AnswerOrigin;
 use crate::config::{ChannelKind, Config};
 use crate::imessage::{Poller as IMessagePoller, Sender as IMessageSender};
+use crate::mattermost::Mattermost;
 use crate::slack::{parse_message_target, Slack};
 use crate::telegram::Telegram;
 use crate::voice::AudioClip;
@@ -140,6 +141,7 @@ pub enum Channel {
     IMessage(IMessageChannel),
     Telegram(Telegram),
     Slack(Slack),
+    Mattermost(Mattermost),
 }
 
 impl Channel {
@@ -174,6 +176,14 @@ impl Channel {
                 cfg.slack_allow_user_ids.clone(),
                 &cfg.state_path,
             )?)),
+            ChannelKind::Mattermost => Ok(Self::Mattermost(Mattermost::new(
+                cfg.mattermost_url()
+                    .ok_or_else(|| anyhow::anyhow!("Mattermost server URL is not configured"))?,
+                cfg.mattermost_token()
+                    .ok_or_else(|| anyhow::anyhow!("Mattermost token is not configured"))?,
+                cfg.mattermost_allow_user_ids.clone(),
+                &cfg.state_path,
+            )?)),
         }
     }
 
@@ -182,6 +192,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::primary_target(channel, configured),
             Self::Telegram(channel) => ChannelContract::primary_target(channel, configured),
             Self::Slack(channel) => ChannelContract::primary_target(channel, configured),
+            Self::Mattermost(channel) => ChannelContract::primary_target(channel, configured),
         }
     }
 
@@ -190,6 +201,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::id(channel),
             Self::Telegram(channel) => ChannelContract::id(channel),
             Self::Slack(channel) => ChannelContract::id(channel),
+            Self::Mattermost(channel) => ChannelContract::id(channel),
         }
     }
 
@@ -198,6 +210,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::poll(channel, since).await,
             Self::Telegram(channel) => ChannelContract::poll(channel, since).await,
             Self::Slack(channel) => ChannelContract::poll(channel, since).await,
+            Self::Mattermost(channel) => ChannelContract::poll(channel, since).await,
         }
     }
 
@@ -206,6 +219,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::latest_cursor(channel).await,
             Self::Telegram(channel) => ChannelContract::latest_cursor(channel).await,
             Self::Slack(channel) => ChannelContract::latest_cursor(channel).await,
+            Self::Mattermost(channel) => ChannelContract::latest_cursor(channel).await,
         }
     }
 
@@ -215,6 +229,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::accept(channel, message),
             Self::Telegram(channel) => ChannelContract::accept(channel, message),
             Self::Slack(channel) => ChannelContract::accept(channel, message),
+            Self::Mattermost(channel) => ChannelContract::accept(channel, message),
         }
     }
 
@@ -223,6 +238,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::reject_reason(channel, message),
             Self::Telegram(channel) => ChannelContract::reject_reason(channel, message),
             Self::Slack(channel) => ChannelContract::reject_reason(channel, message),
+            Self::Mattermost(channel) => ChannelContract::reject_reason(channel, message),
         }
     }
 
@@ -231,6 +247,9 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::approval_origin(channel, message, thread),
             Self::Telegram(channel) => ChannelContract::approval_origin(channel, message, thread),
             Self::Slack(channel) => ChannelContract::approval_origin(channel, message, thread),
+            Self::Mattermost(channel) => {
+                ChannelContract::approval_origin(channel, message, thread)
+            }
         }
     }
 
@@ -239,6 +258,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::route_thread_groups(channel, thread),
             Self::Telegram(channel) => ChannelContract::route_thread_groups(channel, thread),
             Self::Slack(channel) => ChannelContract::route_thread_groups(channel, thread),
+            Self::Mattermost(channel) => ChannelContract::route_thread_groups(channel, thread),
         }
     }
 
@@ -247,6 +267,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::outbound_chunks(channel, text, marker),
             Self::Telegram(channel) => ChannelContract::outbound_chunks(channel, text, marker),
             Self::Slack(channel) => ChannelContract::outbound_chunks(channel, text, marker),
+            Self::Mattermost(channel) => ChannelContract::outbound_chunks(channel, text, marker),
         }
     }
 
@@ -261,6 +282,9 @@ impl Channel {
             Self::Slack(channel) => {
                 ChannelContract::scheduled_outbound_chunks(channel, text, marker)
             }
+            Self::Mattermost(channel) => {
+                ChannelContract::scheduled_outbound_chunks(channel, text, marker)
+            }
         }
     }
 
@@ -270,6 +294,9 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
             Self::Telegram(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
             Self::Slack(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
+            Self::Mattermost(channel) => {
+                ChannelContract::send_chunk(channel, target, chunk).await
+            }
         }
     }
 
@@ -278,6 +305,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::typing_refresh(channel),
             Self::Telegram(channel) => ChannelContract::typing_refresh(channel),
             Self::Slack(channel) => ChannelContract::typing_refresh(channel),
+            Self::Mattermost(channel) => ChannelContract::typing_refresh(channel),
         }
     }
 
@@ -286,6 +314,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Telegram(channel) => ChannelContract::send_typing(channel, target).await,
             Self::Slack(channel) => ChannelContract::send_typing(channel, target).await,
+            Self::Mattermost(channel) => ChannelContract::send_typing(channel, target).await,
         }
     }
 
@@ -294,6 +323,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::download_voice(channel, voice).await,
             Self::Telegram(channel) => ChannelContract::download_voice(channel, voice).await,
             Self::Slack(channel) => ChannelContract::download_voice(channel, voice).await,
+            Self::Mattermost(channel) => ChannelContract::download_voice(channel, voice).await,
         }
     }
 
@@ -303,6 +333,9 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_voice(channel, target, clip).await,
             Self::Telegram(channel) => ChannelContract::send_voice(channel, target, clip).await,
             Self::Slack(channel) => ChannelContract::send_voice(channel, target, clip).await,
+            Self::Mattermost(channel) => {
+                ChannelContract::send_voice(channel, target, clip).await
+            }
         }
     }
 
@@ -311,6 +344,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::delivery_semantics(channel),
             Self::Telegram(channel) => ChannelContract::delivery_semantics(channel),
             Self::Slack(channel) => ChannelContract::delivery_semantics(channel),
+            Self::Mattermost(channel) => ChannelContract::delivery_semantics(channel),
         }
     }
 
@@ -319,6 +353,7 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::shutdown_semantics(channel),
             Self::Telegram(channel) => ChannelContract::shutdown_semantics(channel),
             Self::Slack(channel) => ChannelContract::shutdown_semantics(channel),
+            Self::Mattermost(channel) => ChannelContract::shutdown_semantics(channel),
         }
     }
 }
@@ -684,6 +719,90 @@ impl ChannelContract for Slack {
     }
 }
 
+impl ChannelContract for Mattermost {
+    fn id(&self) -> &'static str {
+        "mattermost"
+    }
+
+    fn primary_target(&self, configured: &str) -> Result<String> {
+        let user = configured.trim();
+        if user.is_empty() {
+            bail!("primary delivery target cannot be empty");
+        }
+        if !self.allows_user(user) {
+            bail!("Mattermost primary user {user:?} is not in mattermost.allow_user_ids");
+        }
+        Ok(format!("user:{user}"))
+    }
+
+    async fn poll(&self, since: i64) -> Result<Vec<RawMessage>> {
+        self.poll(since).await
+    }
+
+    async fn latest_cursor(&self) -> Result<i64> {
+        self.latest_cursor()
+    }
+
+    fn accept(&self, message: &RawMessage) -> Option<(String, String)> {
+        if message.is_from_me
+            || common_reject_reason(message).is_some()
+            || !self.allows_user(&message.handle)
+        {
+            return None;
+        }
+        let (channel, root) = crate::mattermost::parse_message_target(&message.chat_identifier)?;
+        Some((format!("mattermost:dm:{channel}"), format!("{channel}|{root}")))
+    }
+
+    fn reject_reason(&self, message: &RawMessage) -> &'static str {
+        if message.is_from_me {
+            "bot_message"
+        } else if !self.allows_user(&message.handle) {
+            "not_allowlisted"
+        } else {
+            common_reject_reason(message).unwrap_or("unsupported_update")
+        }
+    }
+
+    fn approval_origin(&self, message: &RawMessage, thread: &str) -> AnswerOrigin {
+        let chat_key = crate::mattermost::parse_message_target(&message.chat_identifier)
+            .map(|(channel, _)| channel)
+            .unwrap_or(&message.chat_identifier);
+        AnswerOrigin {
+            channel: self.id().to_string(),
+            thread_key: thread.to_string(),
+            sender_key: message.handle.clone(),
+            chat_key: chat_key.to_string(),
+        }
+    }
+
+    fn route_thread_groups(&self, thread: &str) -> Vec<Vec<String>> {
+        vec![vec![thread.to_string()]]
+    }
+
+    fn outbound_chunks(&self, text: &str, _marker: &str) -> Vec<OutboundChunk> {
+        crate::mattermost::split_text(text)
+            .into_iter()
+            .map(|text| OutboundChunk {
+                text,
+                rich_markdown: true,
+            })
+            .collect()
+    }
+
+    async fn send_chunk(&self, target: &str, chunk: &OutboundChunk) -> Result<()> {
+        self.send_message(target, &chunk.text).await
+    }
+
+    async fn download_voice(&self, _voice: &InboundVoice) -> Result<AudioClip> {
+        bail!("Mattermost voice messages are not supported")
+    }
+
+    async fn send_voice(&self, _target: &str, _clip: &AudioClip) -> Result<()> {
+        bail!("Mattermost voice replies are not supported")
+    }
+}
+
 fn common_reject_reason(message: &RawMessage) -> Option<&'static str> {
     if !message.is_supported {
         Some("unsupported_update")
@@ -811,6 +930,7 @@ mod tests {
         assert_contract::<IMessageChannel>();
         assert_contract::<Telegram>();
         assert_contract::<Slack>();
+        assert_contract::<Mattermost>();
     }
 
     #[test]
