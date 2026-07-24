@@ -794,6 +794,16 @@ impl ChannelContract for Mattermost {
         self.send_message(target, &chunk.text).await
     }
 
+    fn typing_refresh(&self) -> Option<Duration> {
+        // Mattermost clears the client indicator a few seconds after the last
+        // `user_typing`, so refresh while the agent is still working.
+        Some(Duration::from_secs(4))
+    }
+
+    async fn send_typing(&self, target: &str) -> Result<()> {
+        self.send_typing(target).await
+    }
+
     async fn download_voice(&self, _voice: &InboundVoice) -> Result<AudioClip> {
         bail!("Mattermost voice messages are not supported")
     }

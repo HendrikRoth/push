@@ -74,7 +74,9 @@ produce an ambiguous delivery.
 
 Replies are split at 16,383 Unicode characters, Mattermost's default post
 length. Mattermost renders Markdown natively, so replies are sent as raw
-Markdown. Voice messages and replies are not supported.
+Markdown. While the agent works, Push sends a best-effort `user_typing` signal
+on the same WebSocket so the conversation shows a typing indicator. Voice
+messages and replies are not supported.
 
 For scheduled delivery, use an allowlisted Mattermost user ID:
 

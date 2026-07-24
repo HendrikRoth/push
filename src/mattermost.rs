@@ -2,10 +2,12 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -23,6 +25,8 @@ use crate::channel::RawMessage;
 const MAX_TEXT_CHARS: usize = 16_383;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Writer = SplitSink<Socket, Message>;
+type Reader = SplitStream<Socket>;
 
 #[derive(Clone)]
 pub struct Mattermost {
@@ -37,7 +41,11 @@ struct State {
     allow_user_ids: HashSet<String>,
     inbox: Mutex<Inbox>,
     client: Client,
-    socket: AsyncMutex<Option<Socket>>,
+    // The WebSocket is split so outbound frames (typing, pong) never wait on
+    // the receiver's long-lived read borrow during `next().await`.
+    writer: AsyncMutex<Option<Writer>>,
+    reader: AsyncMutex<Option<Reader>>,
+    seq: AtomicU64,
     identity: AsyncMutex<Option<Identity>>,
     notify: Notify,
     last_error: Mutex<Option<String>>,
@@ -134,7 +142,10 @@ impl Mattermost {
                     .timeout(Duration::from_secs(25))
                     .build()
                     .context("build Mattermost HTTP client")?,
-                socket: AsyncMutex::new(None),
+                writer: AsyncMutex::new(None),
+                reader: AsyncMutex::new(None),
+                // seq 1 is reserved for the authentication challenge.
+                seq: AtomicU64::new(2),
                 identity: AsyncMutex::new(None),
                 notify: Notify::new(),
                 last_error: Mutex::new(None),
@@ -176,6 +187,27 @@ impl Mattermost {
                 .insert("root_id".to_string(), Value::String(root));
         }
         self.state.api_post("/api/v4/posts", body).await?;
+        Ok(())
+    }
+
+    /// Sends a best-effort `user_typing` frame on the shared WebSocket writer.
+    /// A closed or not-yet-open connection is silently skipped.
+    pub async fn send_typing(&self, target: &str) -> Result<()> {
+        let Some((channel, root)) = parse_reply_target(target) else {
+            return Ok(());
+        };
+        let seq = self.state.seq.fetch_add(1, Ordering::Relaxed);
+        let frame = json!({
+            "seq": seq,
+            "action": "user_typing",
+            "data": {"channel_id": channel, "parent_id": root}
+        });
+        if let Some(writer) = self.state.writer.lock().await.as_mut() {
+            writer
+                .send(Message::Text(frame.to_string().into()))
+                .await
+                .context("send Mattermost typing")?;
+        }
         Ok(())
     }
 
@@ -286,31 +318,38 @@ impl State {
     }
 
     async fn ensure_socket(&self) -> Result<()> {
-        if self.socket.lock().await.is_some() {
+        if self.reader.lock().await.is_some() {
             return Ok(());
         }
         self.ensure_identity().await?;
-        let (mut socket, _) = tokio_tungstenite::connect_async(&self.websocket_url)
+        let (socket, _) = tokio_tungstenite::connect_async(&self.websocket_url)
             .await
             .context("connect Mattermost WebSocket")?;
+        let (mut writer, reader) = socket.split();
         let challenge = json!({
             "seq": 1,
             "action": "authentication_challenge",
             "data": {"token": self.token}
         });
-        socket
+        writer
             .send(Message::Text(challenge.to_string().into()))
             .await
             .context("authenticate Mattermost WebSocket")?;
-        *self.socket.lock().await = Some(socket);
+        *self.writer.lock().await = Some(writer);
+        *self.reader.lock().await = Some(reader);
         Ok(())
+    }
+
+    async fn reset_socket(&self) {
+        *self.writer.lock().await = None;
+        *self.reader.lock().await = None;
     }
 
     async fn receive_one(&self) -> Result<bool> {
         self.ensure_socket().await?;
         let next = {
-            let mut socket = self.socket.lock().await;
-            socket
+            let mut reader = self.reader.lock().await;
+            reader
                 .as_mut()
                 .context("Mattermost WebSocket connection is unavailable")?
                 .next()
@@ -319,18 +358,18 @@ impl State {
         match next {
             Some(Ok(Message::Text(text))) => self.handle_socket_text(&text).await,
             Some(Ok(Message::Ping(payload))) => {
-                if let Some(socket) = self.socket.lock().await.as_mut() {
-                    socket.send(Message::Pong(payload)).await?;
+                if let Some(writer) = self.writer.lock().await.as_mut() {
+                    writer.send(Message::Pong(payload)).await?;
                 }
                 Ok(false)
             }
             Some(Ok(Message::Close(_))) | None => {
-                *self.socket.lock().await = None;
+                self.reset_socket().await;
                 bail!("Mattermost WebSocket connection closed")
             }
             Some(Ok(_)) => Ok(false),
             Some(Err(error)) => {
-                *self.socket.lock().await = None;
+                self.reset_socket().await;
                 Err(error).context("receive Mattermost WebSocket message")
             }
         }
@@ -385,7 +424,7 @@ async fn receive_loop(state: Arc<State>) {
                 }
             }
             Err(error) => {
-                *state.socket.lock().await = None;
+                state.reset_socket().await;
                 *state.last_error.lock().unwrap() = Some(format!("{error:#}"));
                 state.notify.notify_one();
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -551,6 +590,7 @@ fn parse_reply_target(value: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
     use crate::test_support::temp_path;
+    use tokio::net::TcpListener;
 
     fn identity() -> Identity {
         Identity {
@@ -644,6 +684,57 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), MAX_TEXT_CHARS);
         assert_eq!(chunks[1], "🦀");
+    }
+
+    #[tokio::test]
+    async fn typing_sends_user_typing_frame_on_the_split_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.next().await.unwrap().unwrap().into_text().unwrap()
+        });
+
+        let path = temp_path("mattermost-typing-inbox");
+        let mm = Mattermost::with_inbox(
+            "http://unused".to_string(),
+            "token".to_string(),
+            vec!["U1".to_string()],
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (writer, reader) = client.split();
+        *mm.state.writer.lock().await = Some(writer);
+        *mm.state.reader.lock().await = Some(reader);
+
+        // A held reader borrow must not block the writer-only typing send.
+        let _held = mm.state.reader.lock().await;
+        mm.send_typing("D1|root1").await.unwrap();
+
+        let frame: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(frame["action"], "user_typing");
+        assert_eq!(frame["data"]["channel_id"], "D1");
+        assert_eq!(frame["data"]["parent_id"], "root1");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn typing_without_open_socket_is_a_noop() {
+        let path = temp_path("mattermost-typing-noop");
+        let mm = Mattermost::with_inbox(
+            "http://unused".to_string(),
+            "token".to_string(),
+            vec!["U1".to_string()],
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        mm.send_typing("D1|root1").await.unwrap();
+        mm.send_typing("user:U1").await.unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
