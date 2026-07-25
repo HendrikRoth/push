@@ -281,6 +281,7 @@ async fn run_scheduler(
                     error!("job scheduler tick failed: {error:#}");
                 }
                 deliver_due_reminders(&contexts).await;
+                deliver_budget_alerts(&contexts).await;
             }
         }
     }
@@ -318,6 +319,107 @@ async fn deliver_due_reminders(contexts: &HashMap<String, Ctx>) {
             };
             if let Err(error) = result {
                 warn!("settle reminder {}: {error:#}", reminder.id);
+            }
+        }
+    }
+}
+
+/// Local calendar day for `now_ms` as `(YYYY-MM-DD, midnight-epoch-ms)`.
+fn local_day_bounds(now_ms: i64) -> Option<(String, i64)> {
+    use chrono::TimeZone;
+    let now = chrono::Local.timestamp_millis_opt(now_ms).single()?;
+    let day = now.format("%Y-%m-%d").to_string();
+    let midnight = now.date_naive().and_hms_opt(0, 0, 0)?;
+    let start = chrono::Local.from_local_datetime(&midnight).single()?;
+    Some((day, start.timestamp_millis()))
+}
+
+/// Compact token count, e.g. `1.5k` / `2.3M`.
+fn compact_tokens(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Pushes a one-per-day budget alert to `primary_delivery` for any job whose
+/// token or dollar total for the current local day crosses a configured limit.
+async fn deliver_budget_alerts(contexts: &HashMap<String, Ctx>) {
+    let Some(any) = contexts.values().next() else {
+        return;
+    };
+    let token_limit = any.cfg.usage_alert_tokens;
+    let cost_limit = any.cfg.usage_alert_cost_usd;
+    if token_limit.is_none() && cost_limit.is_none() {
+        return;
+    }
+    let Some(primary) = any.cfg.primary_delivery.clone() else {
+        return;
+    };
+    let Some(dest) = contexts.get(&primary.channel) else {
+        return;
+    };
+    let target = match dest.channel.primary_target(&primary.target) {
+        Ok(target) => target,
+        Err(error) => {
+            warn!("budget alert target invalid: {error}");
+            return;
+        }
+    };
+    let now = now_ms();
+    let Some((day, day_start)) = local_day_bounds(now) else {
+        return;
+    };
+    let totals = match any.history.lock().unwrap().job_usage_since(day_start) {
+        Ok(totals) => totals,
+        Err(error) => {
+            warn!("read job usage for budget alerts: {error:#}");
+            return;
+        }
+    };
+    for total in totals {
+        // Each metric claims independently so a job can alert on both.
+        let mut alerts: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = token_limit {
+            if total.tokens as u64 >= limit {
+                alerts.push((
+                    "tokens",
+                    format!(
+                        "used {} tokens today (limit {})",
+                        compact_tokens(total.tokens),
+                        compact_tokens(limit as i64),
+                    ),
+                ));
+            }
+        }
+        if let Some(limit) = cost_limit {
+            if total.cost_usd >= limit {
+                alerts.push((
+                    "cost",
+                    format!("spent ${:.2} today (limit ${:.2})", total.cost_usd, limit),
+                ));
+            }
+        }
+        for (metric, detail) in alerts {
+            // Claim first (holding the lock only for the claim) so a failed
+            // send never re-alerts and spams the destination.
+            let claimed = any
+                .history
+                .lock()
+                .unwrap()
+                .claim_budget_alert(&total.job_name, &day, metric, now);
+            match claimed {
+                Ok(true) => {
+                    let text = format!("⚠️ Budget: job `{}` {detail}.", total.job_name);
+                    if !reply_to(dest, &target, &text).await {
+                        warn!("budget alert delivery failed for job {}", total.job_name);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => warn!("claim budget alert for {}: {error:#}", total.job_name),
             }
         }
     }

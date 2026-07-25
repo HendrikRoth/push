@@ -74,6 +74,8 @@ pub fn test_config() -> crate::config::Config {
         audit_log_path: "/fake/audit.jsonl".to_string(),
         database_path: "/fake/push.db".to_string(),
         audit_log_content: false,
+        usage_alert_tokens: None,
+        usage_alert_cost_usd: None,
         config_path: String::new(),
         agent_commands: crate::config::AgentCommands::default(),
         assistant_dir: "/fake/assistant".to_string(),

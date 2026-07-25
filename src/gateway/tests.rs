@@ -2776,6 +2776,8 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         audit_log_path: format!("{state_path}.audit.jsonl"),
         database_path: format!("{state_path}.db"),
         audit_log_content: false,
+        usage_alert_tokens: None,
+        usage_alert_cost_usd: None,
         config_path: String::new(),
         agent_commands: crate::config::AgentCommands::default(),
         assistant_dir: assistant_dir.to_string(),
@@ -2909,4 +2911,20 @@ fn telegram_voice_message(row_id: i64, user_id: i64, chat_id: i64) -> RawMessage
         data: Some(vec![1, 2, 3]),
     });
     message
+}
+
+#[test]
+fn compact_tokens_scales_by_magnitude() {
+    assert_eq!(compact_tokens(42), "42");
+    assert_eq!(compact_tokens(1_500), "1.5k");
+    assert_eq!(compact_tokens(2_300_000), "2.3M");
+}
+
+#[test]
+fn local_day_bounds_returns_midnight_before_now() {
+    let now = 1_772_000_000_000; // arbitrary fixed instant
+    let (day, start) = local_day_bounds(now).unwrap();
+    assert_eq!(day.len(), 10); // YYYY-MM-DD
+    assert!(start <= now);
+    assert!(now - start < 24 * 60 * 60 * 1000);
 }

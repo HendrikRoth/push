@@ -104,6 +104,14 @@ pub struct Config {
     pub database_path: String,
     #[serde(default)]
     pub audit_log_content: bool,
+    /// Push a budget alert to `primary_delivery` when a single job's total
+    /// tokens for the current day cross this limit. Unset disables it.
+    #[serde(default)]
+    pub usage_alert_tokens: Option<u64>,
+    /// Push a budget alert to `primary_delivery` when a single job's total
+    /// dollar cost for the current day crosses this limit. Unset disables it.
+    #[serde(default)]
+    pub usage_alert_cost_usd: Option<f64>,
     /// Derived from `assistant_root`. Parsed only for legacy migration.
     #[serde(default = "default_assistant_dir")]
     pub assistant_dir: String,
@@ -997,6 +1005,8 @@ mod tests {
             audit_log_path: root.join("audit.jsonl").to_string_lossy().to_string(),
             database_path: root.join("push.db").to_string_lossy().to_string(),
             audit_log_content: false,
+            usage_alert_tokens: None,
+            usage_alert_cost_usd: None,
             config_path: String::new(),
             agent_commands: AgentCommands::default(),
             assistant_dir: root.to_string_lossy().to_string(),
