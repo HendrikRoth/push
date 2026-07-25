@@ -19,10 +19,32 @@ allow_user_ids = [123456789]
 # bot_token = "xoxb-..." # Prefer SLACK_BOT_TOKEN.
 # allow_user_ids = ["U012ABCDEF"]
 
+# Mattermost alternative. See docs/mattermost.md.
+# channel = "mattermost"
+# Single bot (legacy form):
+# [mattermost]
+# url = "https://mattermost.example.com"
+# token = "..." # Prefer MATTERMOST_TOKEN.
+# allow_user_ids = ["abc123"]
+#
+# Multiple bots: one [[mattermost]] block each. Enabling "mattermost" runs all
+# of them. Address a specific bot as "mattermost:<name>" in primary_delivery.
+# [[mattermost]]
+# name = "work"
+# url = "https://mm.work.example.com"
+# token = "..."
+# allow_user_ids = ["abc123"]
+# [[mattermost]]
+# name = "privat"
+# url = "https://mm.privat.example.com"
+# token = "..."
+# allow_user_ids = ["def456"]
+
 # Required when a job contains an enabled cron trigger.
 # [primary_delivery]
 # channel = "telegram"
 # target = "123456789"
+# For a named Mattermost bot: channel = "mattermost:work"
 
 [voice]
 # Optional. Uncomment to enable voice transcription and spoken replies.

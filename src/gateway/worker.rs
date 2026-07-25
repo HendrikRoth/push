@@ -124,7 +124,11 @@ where
     if let Some(reply) = job_command(ctx, &job).await {
         let delivery = record_and_deliver(ctx, &job, OutboundOrigin::Gateway, &reply).await;
         if delivery.is_ok() {
-            info!("[{}] job command reply sent via {}", job.thread, ctx.channel.id());
+            info!(
+                "[{}] job command reply sent via {}",
+                job.thread,
+                ctx.channel.id()
+            );
         }
         report_delivery(
             ctx,
@@ -378,11 +382,12 @@ where
     let run = async {
         if let Some(refresh) = ctx.channel.typing_refresh() {
             let channel = ctx.channel.clone();
-            let channel_id = channel.id();
+            let channel_id = channel.id().to_string();
             let target = job.target.clone();
             let thread = job.thread.clone();
             run_with_periodic_activity(run, refresh, move || {
                 let channel = channel.clone();
+                let channel_id = channel_id.clone();
                 let target = target.clone();
                 let thread = thread.clone();
                 async move {
@@ -463,7 +468,11 @@ where
                     }
                 }
                 if let Err(e) = ctx.channel.finish_activity(&job.target, true).await {
-                    warn!("[{}] {} activity finish failed: {e}", job.thread, ctx.channel.id());
+                    warn!(
+                        "[{}] {} activity finish failed: {e}",
+                        job.thread,
+                        ctx.channel.id()
+                    );
                 }
             }
             report_delivery(
@@ -769,7 +778,11 @@ async fn finish_run_with_gateway_reply(ctx: &Ctx, job: &Job, reply: &str, labels
     // A failed, timed-out, or interrupted run still clears its in-progress
     // signal, marking the message as not successfully answered.
     if let Err(e) = ctx.channel.finish_activity(&job.target, false).await {
-        warn!("[{}] {} activity finish failed: {e}", job.thread, ctx.channel.id());
+        warn!(
+            "[{}] {} activity finish failed: {e}",
+            job.thread,
+            ctx.channel.id()
+        );
     }
 }
 
@@ -875,7 +888,11 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
         return Some(list_reminders(ctx, job));
     }
     if trimmed == "/reminder" || trimmed.starts_with("/reminder ") {
-        return Some(reminder_command(ctx, job, trimmed["/reminder".len()..].trim()));
+        return Some(reminder_command(
+            ctx,
+            job,
+            trimmed["/reminder".len()..].trim(),
+        ));
     }
     if trimmed == "/remind" || trimmed.starts_with("/remind ") {
         return Some(set_reminder(ctx, job, trimmed["/remind".len()..].trim()));
@@ -1241,9 +1258,7 @@ fn list_reminders(ctx: &Ctx, job: &Job) -> String {
 }
 
 fn reminder_command(ctx: &Ctx, job: &Job, args: &str) -> String {
-    let (verb, rest) = args
-        .split_once(char::is_whitespace)
-        .unwrap_or((args, ""));
+    let (verb, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
     if !verb.eq_ignore_ascii_case("cancel") {
         return "Usage: /reminder cancel <id>".to_string();
     }
@@ -1550,7 +1565,10 @@ mod attach_tests {
             vec!["out.md".to_string(), "dir/b.png".to_string()]
         );
         assert_eq!(parse_attach_markers("no markers"), Vec::<String>::new());
-        assert_eq!(parse_attach_markers("[[attach: unclosed"), Vec::<String>::new());
+        assert_eq!(
+            parse_attach_markers("[[attach: unclosed"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1565,8 +1583,14 @@ mod attach_tests {
 
     #[test]
     fn sanitize_filename_strips_paths_and_dot_names() {
-        assert_eq!(sanitize_filename("../../etc/passwd").as_deref(), Some("passwd"));
-        assert_eq!(sanitize_filename("dir/report.md").as_deref(), Some("report.md"));
+        assert_eq!(
+            sanitize_filename("../../etc/passwd").as_deref(),
+            Some("passwd")
+        );
+        assert_eq!(
+            sanitize_filename("dir/report.md").as_deref(),
+            Some("report.md")
+        );
         assert_eq!(sanitize_filename(".."), None);
         assert_eq!(sanitize_filename(""), None);
     }
@@ -1627,7 +1651,10 @@ mod command_tests {
     #[test]
     fn parse_slash_splits_name_and_argument() {
         assert_eq!(parse_slash("/jobs"), Some(("/jobs", "")));
-        assert_eq!(parse_slash("  /run  cve-check  "), Some(("/run", "cve-check")));
+        assert_eq!(
+            parse_slash("  /run  cve-check  "),
+            Some(("/run", "cve-check"))
+        );
         assert_eq!(parse_slash("/run a b"), Some(("/run", "a b")));
         assert_eq!(parse_slash("hello"), None);
         assert_eq!(parse_slash(""), None);
@@ -1663,7 +1690,9 @@ mod command_tests {
         assert!(report.contains("2m 5s"));
         assert!(report.contains("cve-check (Codex): 1 runs, 1.0k tokens (in 800 / out 200)"));
         // Codex reports no cost, so no dollar figure is shown for it.
-        assert!(!report.lines().any(|l| l.contains("cve-check") && l.contains('$')));
+        assert!(!report
+            .lines()
+            .any(|l| l.contains("cve-check") && l.contains('$')));
     }
 
     #[test]
@@ -1864,7 +1893,11 @@ mod reminder_tests {
         let weekday_next = next_recurrence(base, "weekdays").unwrap();
         assert!(weekday_next >= base + 86_400_000);
         assert!(weekday_next <= base + 3 * 86_400_000);
-        let day = Local.timestamp_millis_opt(weekday_next).single().unwrap().weekday();
+        let day = Local
+            .timestamp_millis_opt(weekday_next)
+            .single()
+            .unwrap()
+            .weekday();
         assert!(!matches!(day, Weekday::Sat | Weekday::Sun));
     }
 }

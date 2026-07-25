@@ -59,6 +59,37 @@ and authenticates the WebSocket with an `authentication_challenge`. The
 WebSocket URL is derived from `mattermost.url` by swapping the HTTP scheme for
 `ws`/`wss` and appending `/api/v4/websocket`.
 
+## Multiple bots
+
+To run several Mattermost bots from one Push instance — different servers, or
+several bots on the same server — replace the single `[mattermost]` table with
+one `[[mattermost]]` block per bot. Each block needs a unique `name`:
+
+```toml
+channel = "mattermost"
+
+[[mattermost]]
+name = "work"
+url = "https://mm.work.example.com"
+token = "work-bot-token"
+allow_user_ids = ["26-char-user-id"]
+
+[[mattermost]]
+name = "privat"
+url = "https://mm.privat.example.com"
+token = "privat-bot-token"
+allow_user_ids = ["26-char-user-id"]
+```
+
+Enabling `mattermost` (via `channel` or `channels`) runs every configured
+`[[mattermost]]` bot. Each bot has its own identity `mattermost:<name>`, its own
+poll cursor, its own SQLite inbox, and its own thread namespace, so two bots
+never share sessions even on the same server. The legacy single `[mattermost]`
+table keeps the bare identity `mattermost`; the two forms are mutually
+exclusive. Each named bot needs an inline `token` (the shared `MATTERMOST_TOKEN`
+environment variable applies only to the legacy single-bot form). Address a
+specific bot from `[primary_delivery]` with `channel = "mattermost:work"`.
+
 ## Delivery and recovery
 
 Push validates the message shape, sender ID, and bot origin before an event can
@@ -71,6 +102,8 @@ Thread keys are:
 - `mattermost:dm:<channel-id>` — a direct message is one conversation.
 - `mattermost:ch:<channel-id>:<root-id>` — each channel or group-message thread
   is its own session.
+
+Named bots prefix these with their identity, e.g. `mattermost:work:dm:<channel-id>`.
 
 Replies go to the Mattermost thread rooted at the originating post, or open one
 rooted at the post when it was top-level. When the bot replies it records that
