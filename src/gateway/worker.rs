@@ -894,7 +894,7 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
         },
         "/usage" => Some(usage_report(ctx)),
         "/help" => Some(
-            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/usage - token, cost and time per job\n/remind <when> <message> - remind you later (2h, 15:00, or daily 09:00)\n/reminders - list pending reminders\n/reminder cancel <id> - cancel a reminder\n/help - this message"
+            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/logs <name> - recent runs of a job with output\n/usage - token, cost and time per job\n/remind <when> <message> - remind you later (2h, 15:00, or daily 09:00)\n/reminders - list pending reminders\n/reminder cancel <id> - cancel a reminder\n/help - this message"
                 .to_string(),
         ),
         _ => None,
@@ -988,8 +988,68 @@ async fn job_command(ctx: &Ctx, job: &Job) -> Option<String> {
         "/jobs" => Some(list_jobs(ctx)),
         "/run" => Some(run_job(ctx, arg).await),
         "/status" => Some(job_status(ctx)),
+        "/logs" => Some(job_logs(ctx, arg)),
         _ => None,
     }
+}
+
+/// Number of recent runs `/logs` shows, and the per-run output cap in chars.
+const LOGS_RUN_LIMIT: usize = 5;
+const LOGS_OUTPUT_CHARS: usize = 600;
+
+/// Builds the `/logs <job>` reply: recent runs of one job with their output.
+fn job_logs(ctx: &Ctx, arg: &str) -> String {
+    if arg.is_empty() {
+        return "Usage: /logs <job>".to_string();
+    }
+    if let Err(error) = crate::jobs::validate_job_name(arg) {
+        return format!("Invalid job name: {error}");
+    }
+    let ledger = match crate::jobs::Ledger::open(&ctx.cfg.database_path) {
+        Ok(ledger) => ledger,
+        Err(error) => return format!("Couldn't open run history: {error}"),
+    };
+    match ledger.runs(Some(arg)) {
+        Ok(runs) => format_logs(arg, &runs, now_ms()),
+        Err(error) => format!("Couldn't read run history: {error}"),
+    }
+}
+
+fn format_logs(job_name: &str, runs: &[crate::jobs::RunRow], now_ms: i64) -> String {
+    if runs.is_empty() {
+        return format!("No runs recorded for job `{job_name}`.");
+    }
+    let mut lines = vec![format!(
+        "Logs for `{job_name}` (last {}):",
+        runs.len().min(LOGS_RUN_LIMIT)
+    )];
+    for run in runs.iter().take(LOGS_RUN_LIMIT) {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} {} — {}",
+            state_icon(&run.state),
+            run.state,
+            relative_time(now_ms - run.queued_at_ms),
+        ));
+        let output = run
+            .result
+            .as_deref()
+            .or(run.error.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("(no output recorded)");
+        lines.push(truncate_chars(output, LOGS_OUTPUT_CHARS));
+    }
+    lines.join("\n")
+}
+
+/// Truncates on a char boundary, appending a marker when it cuts the text.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}… [truncated]")
 }
 
 fn job_status(ctx: &Ctx) -> String {
@@ -1700,6 +1760,58 @@ mod command_tests {
     #[test]
     fn format_status_handles_no_runs() {
         assert_eq!(format_status(&[], 0), "No job runs yet.");
+    }
+
+    #[test]
+    fn format_logs_shows_recent_runs_with_output() {
+        let now = 100 * 86_400_000;
+        let mut ok = run_row("triage", "succeeded", now - 60_000);
+        ok.result = Some("  processed 12 emails  ".to_string());
+        let mut bad = run_row("triage", "failed", now - 3_600_000);
+        bad.error = Some("backend: api down".to_string());
+        let logs = format_logs("triage", &[ok, bad], now);
+
+        assert!(logs.starts_with("Logs for `triage` (last 2):"));
+        assert!(logs.contains("succeeded — 1m ago"));
+        assert!(logs.contains(state_icon("succeeded")));
+        assert!(logs.contains("processed 12 emails"));
+        assert!(logs.contains("failed — 1h ago"));
+        assert!(logs.contains("backend: api down"));
+    }
+
+    #[test]
+    fn format_logs_caps_run_count_and_output_length() {
+        let now = 100 * 86_400_000;
+        let runs: Vec<_> = (0..8)
+            .map(|i| {
+                let mut row = run_row("triage", "succeeded", now - i * 60_000);
+                row.result = Some("x".repeat(LOGS_OUTPUT_CHARS + 50));
+                row
+            })
+            .collect();
+        let logs = format_logs("triage", &runs, now);
+
+        assert!(logs.contains(&format!("(last {LOGS_RUN_LIMIT})")));
+        assert_eq!(logs.matches("succeeded").count(), LOGS_RUN_LIMIT);
+        assert!(logs.contains("… [truncated]"));
+    }
+
+    #[test]
+    fn format_logs_reports_missing_output_and_empty_history() {
+        let now = 100 * 86_400_000;
+        let bare = run_row("triage", "succeeded", now);
+        let logs = format_logs("triage", &[bare], now);
+        assert!(logs.contains("(no output recorded)"));
+        assert_eq!(
+            format_logs("triage", &[], now),
+            "No runs recorded for job `triage`."
+        );
+    }
+
+    #[test]
+    fn truncate_chars_marks_only_when_cutting() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("abcdef", 3), "abc… [truncated]");
     }
 }
 
