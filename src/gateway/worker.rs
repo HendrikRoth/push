@@ -120,6 +120,22 @@ where
         return;
     }
 
+    if let Some(reply) = job_command(ctx, &job).await {
+        let delivery = record_and_deliver(ctx, &job, OutboundOrigin::Gateway, &reply).await;
+        if delivery.is_ok() {
+            info!("[{}] job command reply sent via {}", job.thread, ctx.channel.id());
+        }
+        report_delivery(
+            ctx,
+            &job,
+            delivery,
+            &reply,
+            "job_command",
+            "record job command reply",
+        );
+        return;
+    }
+
     let Some(runner) = ctx.runners.get(&job.backend) else {
         error!(
             "[{}] no runner configured for {}",
@@ -711,10 +727,77 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
             Err(_) => Some("Couldn't reset the conversation.".to_string()),
         },
         "/help" => Some(
-            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/help - this message"
+            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/help - this message"
                 .to_string(),
         ),
         _ => None,
+    }
+}
+
+/// Splits a slash command into its name and trimmed argument, or None when the
+/// text is not a command.
+fn parse_slash(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim();
+    if !text.starts_with('/') {
+        return None;
+    }
+    Some(
+        text.split_once(char::is_whitespace)
+            .map_or((text, ""), |(name, arg)| (name, arg.trim())),
+    )
+}
+
+/// Handles job-management chat commands that need async work or arguments.
+async fn job_command(ctx: &Ctx, job: &Job) -> Option<String> {
+    let (name, arg) = parse_slash(&job.text)?;
+    match name.to_ascii_lowercase().as_str() {
+        "/jobs" => Some(list_jobs(ctx)),
+        "/run" => Some(run_job(ctx, arg).await),
+        _ => None,
+    }
+}
+
+fn list_jobs(ctx: &Ctx) -> String {
+    match crate::jobs::Catalog::load(&ctx.cfg) {
+        Ok(catalog) => format_jobs(&catalog),
+        Err(error) => format!("Couldn't load jobs: {error}"),
+    }
+}
+
+fn format_jobs(catalog: &crate::jobs::Catalog) -> String {
+    if catalog.jobs.is_empty() {
+        return "No jobs are defined.".to_string();
+    }
+    let mut lines = vec!["Jobs:".to_string()];
+    for (name, job) in &catalog.jobs {
+        let triggers = if job.triggers.is_empty() {
+            "manual only".to_string()
+        } else {
+            job.triggers
+                .iter()
+                .map(|trigger| {
+                    let state = if trigger.enabled { "on" } else { "off" };
+                    format!("{state} `{}`", trigger.schedule)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!("• {name} — {triggers}"));
+    }
+    lines.join("\n")
+}
+
+async fn run_job(ctx: &Ctx, name: &str) -> String {
+    if name.is_empty() {
+        return "Usage: /run <job-name>".to_string();
+    }
+    let job = match crate::jobs::Catalog::load_named(&ctx.cfg, name) {
+        Ok(job) => job,
+        Err(error) => return format!("Couldn't load job `{name}`: {error}"),
+    };
+    match crate::jobs::run_manual(&ctx.cfg, job).await {
+        Ok((_, output)) => output,
+        Err(error) => format!("Job `{name}` failed: {error}"),
     }
 }
 
@@ -944,5 +1027,71 @@ fn backend_request<'a>(
         work_dir,
         instructions,
         prompt,
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use crate::config::AgentBackend;
+    use crate::jobs::{Catalog, Job, Trigger};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn job(triggers: Vec<Trigger>) -> Job {
+        Job {
+            name: "sample".to_string(),
+            path: PathBuf::new(),
+            body: String::new(),
+            timeout: Duration::from_secs(1),
+            workdir: PathBuf::new(),
+            backend: AgentBackend::Codex,
+            snapshot_hash: String::new(),
+            evals: Vec::new(),
+            triggers,
+        }
+    }
+
+    fn cron(schedule: &str, enabled: bool) -> Trigger {
+        Trigger {
+            id: "t".to_string(),
+            kind: "cron".to_string(),
+            schedule: schedule.to_string(),
+            timezone: "UTC".to_string(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn parse_slash_splits_name_and_argument() {
+        assert_eq!(parse_slash("/jobs"), Some(("/jobs", "")));
+        assert_eq!(parse_slash("  /run  cve-check  "), Some(("/run", "cve-check")));
+        assert_eq!(parse_slash("/run a b"), Some(("/run", "a b")));
+        assert_eq!(parse_slash("hello"), None);
+        assert_eq!(parse_slash(""), None);
+    }
+
+    #[test]
+    fn format_jobs_lists_names_and_trigger_state() {
+        let mut jobs = BTreeMap::new();
+        jobs.insert("alpha".to_string(), job(vec![cron("0 8 * * *", true)]));
+        jobs.insert("beta".to_string(), job(Vec::new()));
+        let catalog = Catalog {
+            jobs,
+            errors: Vec::new(),
+        };
+
+        let listing = format_jobs(&catalog);
+        assert!(listing.contains("• alpha — on `0 8 * * *`"));
+        assert!(listing.contains("• beta — manual only"));
+    }
+
+    #[test]
+    fn format_jobs_handles_empty_catalog() {
+        let catalog = Catalog {
+            jobs: BTreeMap::new(),
+            errors: Vec::new(),
+        };
+        assert_eq!(format_jobs(&catalog), "No jobs are defined.");
     }
 }

@@ -115,6 +115,17 @@ If the same job is already active, the new attempt is recorded as
 the released OS lock, so a live process is not reclaimed from database state
 alone.
 
+## Chat commands
+
+From an allowlisted conversation you can manage jobs without the CLI:
+
+- `/jobs` — list every configured job with its trigger schedules and on/off state.
+- `/run <name>` — run a job now and get its result back in the same chat. This
+  is a manual run: it ignores triggers, respects the per-job lock, and does not
+  touch scheduled delivery.
+
+`/help` lists these alongside `/clear` and `/stop`.
+
 ## Schedule a job
 
 Add one or more five-field cron triggers:
