@@ -528,25 +528,7 @@ struct Chat {
 }
 
 pub fn split_text(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_len = 0;
-    for character in text.chars() {
-        let character_len = character.len_utf16();
-        if current_len + character_len > TEXT_LIMIT && !current.is_empty() {
-            chunks.push(std::mem::take(&mut current));
-            current_len = 0;
-        }
-        current.push(character);
-        current_len += character_len;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+    crate::chunk::split(text, TEXT_LIMIT, |character| character.len_utf16())
 }
 
 #[cfg(test)]

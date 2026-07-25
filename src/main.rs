@@ -7,6 +7,7 @@ mod approval;
 mod assistant;
 mod audit;
 mod channel;
+mod chunk;
 mod claude;
 mod codex;
 mod config;
