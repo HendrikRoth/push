@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tracing::warn;
 
 use crate::channel::{InboundFile, OutboundFile, RawMessage};
 
@@ -245,6 +246,14 @@ impl Mattermost {
     /// Sends a best-effort `user_typing` frame on the shared WebSocket writer.
     /// A closed or not-yet-open connection is silently skipped.
     pub async fn send_typing(&self, target: &str) -> Result<()> {
+        // Channel targets carry the triggering post ID; give it a one-time
+        // reaction so a @mention in a busy channel has a visible acknowledgement
+        // that outlives the ephemeral typing signal. This runs before the typing
+        // frame so a failed best-effort typing send never suppresses the durable
+        // acknowledgement.
+        if let Some(post_id) = reply_target_post_id(target) {
+            self.react_working(post_id).await;
+        }
         let Some((channel, root)) = parse_reply_target(target) else {
             return Ok(());
         };
@@ -260,12 +269,6 @@ impl Mattermost {
                 .await
                 .context("send Mattermost typing")?;
         }
-        // Channel targets carry the triggering post ID; give it a one-time
-        // reaction so a @mention in a busy channel has a visible acknowledgement
-        // that outlives the ephemeral typing signal.
-        if let Some(post_id) = reply_target_post_id(target) {
-            self.react_working(post_id).await;
-        }
         Ok(())
     }
 
@@ -276,7 +279,7 @@ impl Mattermost {
         let Ok(identity) = self.state.ensure_identity().await else {
             return;
         };
-        let posted = self
+        match self
             .state
             .api_post(
                 "/api/v4/reactions",
@@ -287,9 +290,13 @@ impl Mattermost {
                 }),
             )
             .await
-            .is_ok();
-        if posted {
-            self.state.reacted.lock().unwrap().insert(post_id.to_string());
+        {
+            Ok(_) => {
+                self.state.reacted.lock().unwrap().insert(post_id.to_string());
+            }
+            Err(error) => {
+                warn!("mattermost working reaction on post {post_id} failed: {error:#}");
+            }
         }
     }
 
