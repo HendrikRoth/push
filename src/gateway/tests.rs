@@ -2555,7 +2555,7 @@ async fn one_channel_failure_does_not_stop_another_and_shutdown_reaches_survivor
         started.store(true, Ordering::SeqCst);
         shutdown.changed().await.unwrap();
         stopped.store(true, Ordering::SeqCst);
-        Ok("telegram")
+        Ok("telegram".to_string())
     });
     let shutdown = async {
         while !healthy_started.load(Ordering::SeqCst) {
@@ -2762,6 +2762,7 @@ fn test_config(state_path: &str, _sessions_dir: &str, assistant_dir: &str) -> Co
         mattermost_url: None,
         mattermost_token: None,
         mattermost_allow_user_ids: Vec::new(),
+        mattermost: Vec::new(),
         voice_openai_api_key: None,
         voice_name: crate::config::DEFAULT_VOICE_NAME.to_string(),
         agent: "codex".to_string(),

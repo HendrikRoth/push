@@ -74,6 +74,10 @@ pub struct Config {
     pub mattermost_token: Option<String>,
     #[serde(default)]
     pub mattermost_allow_user_ids: Vec<String>,
+    /// One entry per `[[mattermost]]` block. Mutually exclusive with the legacy
+    /// single `[mattermost]` table (which populates the `mattermost_*` fields).
+    #[serde(default)]
+    pub mattermost: Vec<MattermostInstance>,
     #[serde(default)]
     pub voice_openai_api_key: Option<String>,
     #[serde(default = "default_voice_name")]
@@ -241,15 +245,21 @@ impl Config {
                 ("allow_user_ids", "slack_allow_user_ids"),
             ],
         )?;
-        flatten_provider_section(
-            root,
-            "mattermost",
-            &[
-                ("url", "mattermost_url"),
-                ("token", "mattermost_token"),
-                ("allow_user_ids", "mattermost_allow_user_ids"),
-            ],
-        )?;
+        // `[[mattermost]]` (array of tables) configures multiple named bots and
+        // is parsed directly into `Config::mattermost`. Only the legacy single
+        // `[mattermost]` table is flattened into the `mattermost_*` fields.
+        let mattermost_is_array = root.get("mattermost").is_some_and(toml::Value::is_array);
+        if !mattermost_is_array {
+            flatten_provider_section(
+                root,
+                "mattermost",
+                &[
+                    ("url", "mattermost_url"),
+                    ("token", "mattermost_token"),
+                    ("allow_user_ids", "mattermost_allow_user_ids"),
+                ],
+            )?;
+        }
         flatten_provider_section(
             root,
             "voice",
@@ -297,6 +307,13 @@ impl Config {
                 &assistant_root,
                 c.mattermost_token.as_deref(),
             )?;
+            for instance in &c.mattermost {
+                validate_inline_mattermost_token_location(
+                    &config_path,
+                    &assistant_root,
+                    instance.token.as_deref(),
+                )?;
+            }
             validate_inline_voice_key_location(
                 &config_path,
                 &assistant_root,
@@ -414,6 +431,88 @@ impl Config {
             .map(str::trim)
             .filter(|url| !url.is_empty())
             .map(str::to_string)
+    }
+
+    /// Resolves every configured Mattermost bot into a ready-to-build instance.
+    ///
+    /// `[[mattermost]]` blocks and the legacy single `[mattermost]` table are
+    /// mutually exclusive. The legacy form yields one instance with id
+    /// `"mattermost"` (preserving existing cursors and thread keys); each
+    /// `[[mattermost]]` block yields id `"mattermost:<name>"`.
+    pub fn mattermost_instances(&self) -> Result<Vec<ResolvedMattermost>> {
+        let has_legacy = self.mattermost_url.is_some()
+            || self.mattermost_token.is_some()
+            || !self.mattermost_allow_user_ids.is_empty();
+        if !self.mattermost.is_empty() {
+            if has_legacy {
+                bail!(
+                    "use either the legacy single [mattermost] table or [[mattermost]] blocks, not both"
+                );
+            }
+            let mut seen = HashSet::new();
+            let mut resolved = Vec::with_capacity(self.mattermost.len());
+            for instance in &self.mattermost {
+                let name = instance.name.trim();
+                if name.is_empty() {
+                    bail!("each [[mattermost]] block needs a non-empty name");
+                }
+                if name.contains(':') || name.chars().any(char::is_whitespace) {
+                    bail!("mattermost name {name:?} must not contain ':' or whitespace");
+                }
+                if !seen.insert(name.to_string()) {
+                    bail!("duplicate [[mattermost]] name {name:?}");
+                }
+                let url = instance.url.trim();
+                if url.is_empty() {
+                    bail!("[[mattermost]] {name:?} needs a non-empty url");
+                }
+                let token = instance
+                    .token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_string)
+                    .with_context(|| format!("[[mattermost]] {name:?} needs a non-empty token"))?;
+                resolved.push(ResolvedMattermost {
+                    id: format!("mattermost:{name}"),
+                    url: url.to_string(),
+                    token,
+                    allow_user_ids: instance.allow_user_ids.clone(),
+                });
+            }
+            return Ok(resolved);
+        }
+        match (self.mattermost_url(), self.mattermost_token()) {
+            (Some(url), Some(token)) => Ok(vec![ResolvedMattermost {
+                id: ChannelKind::Mattermost.as_str().to_string(),
+                url,
+                token,
+                allow_user_ids: self.mattermost_allow_user_ids.clone(),
+            }]),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Expands enabled channel kinds into concrete running channels. Every kind
+    /// maps to one channel except Mattermost, which maps to one per instance.
+    pub fn enabled_channels(&self) -> Result<Vec<ChannelId>> {
+        let mut channels = Vec::new();
+        for kind in self.enabled_channel_kinds()? {
+            if kind == ChannelKind::Mattermost {
+                for instance in self.mattermost_instances()? {
+                    channels.push(ChannelId {
+                        kind,
+                        id: instance.id,
+                    });
+                }
+            } else {
+                channels.push(ChannelId {
+                    kind,
+                    id: kind.as_str().to_string(),
+                });
+            }
+        }
+        Ok(channels)
     }
 
     pub fn route_for_message(
@@ -592,23 +691,22 @@ impl Config {
                     }
                 }
                 ChannelKind::Mattermost => {
-                    if self.mattermost_allow_user_ids.is_empty()
-                        || self
-                            .mattermost_allow_user_ids
-                            .iter()
-                            .any(|user| user.trim().is_empty())
-                    {
-                        bail!("set mattermost.allow_user_ids to explicit Mattermost user IDs");
+                    let instances = self.mattermost_instances()?;
+                    if instances.is_empty() {
+                        bail!(
+                            "set mattermost.url or add a [[mattermost]] block to enable Mattermost"
+                        );
                     }
-                    if self.mattermost_url().is_none() {
-                        bail!("set mattermost.url to your Mattermost server URL");
-                    }
-                    if self
-                        .mattermost_token
-                        .as_deref()
-                        .is_some_and(|v| v.trim().is_empty())
-                    {
-                        bail!("mattermost.token cannot be empty");
+                    for instance in &instances {
+                        let label = &instance.id;
+                        if instance.allow_user_ids.is_empty()
+                            || instance
+                                .allow_user_ids
+                                .iter()
+                                .any(|user| user.trim().is_empty())
+                        {
+                            bail!("set {label} allow_user_ids to explicit Mattermost user IDs");
+                        }
                     }
                 }
             }
@@ -823,6 +921,37 @@ pub struct RouteRule {
     pub agent: String,
 }
 
+/// A single named Mattermost bot, configured as a `[[mattermost]]` block.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MattermostInstance {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub allow_user_ids: Vec<String>,
+}
+
+/// A fully resolved Mattermost bot ready to build a channel. `id` is the
+/// channel identity used for cursors, thread keys, audit, and addressing:
+/// `"mattermost"` for the legacy single bot, `"mattermost:<name>"` otherwise.
+#[derive(Debug, Clone)]
+pub struct ResolvedMattermost {
+    pub id: String,
+    pub url: String,
+    pub token: String,
+    pub allow_user_ids: Vec<String>,
+}
+
+/// Identifies one running channel. For every kind except Mattermost there is
+/// exactly one and `id == kind.as_str()`. Mattermost expands to one per
+/// configured instance, each with its own `id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelId {
+    pub kind: ChannelKind,
+    pub id: String,
+}
+
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrimaryDeliveryConfig {
     pub channel: String,
@@ -991,6 +1120,7 @@ mod tests {
             mattermost_url: None,
             mattermost_token: None,
             mattermost_allow_user_ids: Vec::new(),
+            mattermost: Vec::new(),
             voice_openai_api_key: None,
             voice_name: DEFAULT_VOICE_NAME.to_string(),
             agent: "codex".to_string(),
@@ -1122,5 +1252,80 @@ mod tests {
         assert!(error.to_string().contains("not a symlink"));
         let _ = std::fs::remove_dir_all(assistant);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn mattermost_blocks_resolve_to_named_instances_and_expand_channels() {
+        let cfg: Config = toml::from_str(
+            r#"
+channels = ["mattermost"]
+
+[[mattermost]]
+name = "work"
+url = "https://mm.work.example/"
+token = "tok-work"
+allow_user_ids = ["U1"]
+
+[[mattermost]]
+name = "privat"
+url = "https://mm.privat.example"
+token = "tok-privat"
+allow_user_ids = ["U2"]
+"#,
+        )
+        .unwrap();
+
+        let instances = cfg.mattermost_instances().unwrap();
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].id, "mattermost:work");
+        assert_eq!(instances[0].url, "https://mm.work.example/");
+        assert_eq!(instances[1].id, "mattermost:privat");
+
+        let enabled = cfg.enabled_channels().unwrap();
+        assert_eq!(
+            enabled.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["mattermost:work", "mattermost:privat"]
+        );
+        assert!(enabled.iter().all(|c| c.kind == ChannelKind::Mattermost));
+    }
+
+    #[test]
+    fn legacy_single_mattermost_keeps_unnamed_instance_id() {
+        let cfg = Config {
+            mattermost_url: Some("https://mm.example".to_string()),
+            mattermost_token: Some("tok".to_string()),
+            mattermost_allow_user_ids: vec!["U1".to_string()],
+            ..toml::from_str("channels = ['mattermost']").unwrap()
+        };
+
+        let instances = cfg.mattermost_instances().unwrap();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, "mattermost");
+        assert_eq!(cfg.enabled_channels().unwrap()[0].id, "mattermost");
+    }
+
+    #[test]
+    fn mixing_legacy_and_block_mattermost_is_rejected() {
+        let cfg = Config {
+            mattermost_url: Some("https://mm.example".to_string()),
+            ..toml::from_str(
+                "channels = ['mattermost']\n[[mattermost]]\nname='work'\nurl='https://x'\ntoken='t'\nallow_user_ids=['U1']",
+            )
+            .unwrap()
+        };
+
+        let error = cfg.mattermost_instances().unwrap_err();
+        assert!(error.to_string().contains("not both"));
+    }
+
+    #[test]
+    fn duplicate_mattermost_names_are_rejected() {
+        let cfg: Config = toml::from_str(
+            "channels=['mattermost']\n[[mattermost]]\nname='work'\nurl='https://a'\ntoken='t'\nallow_user_ids=['U1']\n[[mattermost]]\nname='work'\nurl='https://b'\ntoken='t'\nallow_user_ids=['U2']",
+        )
+        .unwrap();
+
+        let error = cfg.mattermost_instances().unwrap_err();
+        assert!(error.to_string().contains("duplicate"));
     }
 }

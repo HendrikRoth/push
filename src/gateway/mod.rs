@@ -22,7 +22,7 @@ use crate::approval::AnswerOrigin;
 use crate::approval::AnswerOutcome;
 use crate::audit::{AuditEvent, AuditLog};
 use crate::channel::{Channel, InboundFile, InboundVoice, RawMessage};
-use crate::config::{AgentBackend, ChannelKind, Config, PrimaryDeliveryConfig};
+use crate::config::{AgentBackend, ChannelId, ChannelKind, Config, PrimaryDeliveryConfig};
 use crate::history::{History, OutboundOrigin};
 use crate::jobs;
 use crate::store::Store;
@@ -116,7 +116,7 @@ struct WorkerState {
 
 impl GatewayGroup {
     pub fn new(cfg: Config) -> Result<Self> {
-        let enabled = cfg.enabled_channel_kinds()?;
+        let enabled = cfg.enabled_channels()?;
         let store = Arc::new(Mutex::new(Store::open(&cfg.state_path)?));
         let history = Arc::new(Mutex::new(History::open(&cfg.database_path).with_context(
             || format!("open canonical history database {}", cfg.database_path),
@@ -124,10 +124,10 @@ impl GatewayGroup {
         let runners = Arc::new(runners(&cfg));
         let audit_lock = Arc::new(Mutex::new(()));
         let mut gateways = Vec::with_capacity(enabled.len());
-        for kind in enabled {
+        for channel_id in enabled {
             gateways.push(Gateway::new_with_shared(
                 cfg.clone(),
-                kind,
+                channel_id,
                 store.clone(),
                 history.clone(),
                 runners.clone(),
@@ -146,12 +146,14 @@ impl GatewayGroup {
             .primary_delivery
             .as_ref()
             .context("primary delivery is not configured")?;
-        let kind =
-            ChannelKind::parse(&configured.channel).context("invalid primary delivery channel")?;
+        // The channel may name a specific Mattermost instance, e.g.
+        // "mattermost:work"; the kind is the part before the first ':'.
+        let kind_name = configured.channel.split(':').next().unwrap_or_default();
+        ChannelKind::parse(kind_name).context("invalid primary delivery channel")?;
         let gateway = self
             .gateways
             .iter()
-            .find(|gateway| gateway.channel.id() == kind.as_str())
+            .find(|gateway| gateway.channel.id() == configured.channel)
             .with_context(|| {
                 format!(
                     "primary delivery channel {:?} is not enabled in channels",
@@ -163,7 +165,7 @@ impl GatewayGroup {
             .primary_target(&configured.target)
             .context("invalid primary delivery target")?;
         Ok(PrimaryDestination {
-            channel: kind.as_str().to_string(),
+            channel: configured.channel.clone(),
             target,
         })
     }
@@ -217,7 +219,7 @@ impl GatewayGroup {
             tokio::spawn(async move { run_scheduler(scheduler, contexts, receiver).await });
         let mut tasks = JoinSet::new();
         for gateway in self.gateways {
-            let channel = gateway.channel.id();
+            let channel = gateway.channel.id().to_string();
             let receiver = shutdown_rx.clone();
             tasks.spawn(async move {
                 gateway
@@ -406,11 +408,11 @@ async fn deliver_budget_alerts(contexts: &HashMap<String, Ctx>) {
         for (metric, detail) in alerts {
             // Claim first (holding the lock only for the claim) so a failed
             // send never re-alerts and spams the destination.
-            let claimed = any
-                .history
-                .lock()
-                .unwrap()
-                .claim_budget_alert(&total.job_name, &day, metric, now);
+            let claimed =
+                any.history
+                    .lock()
+                    .unwrap()
+                    .claim_budget_alert(&total.job_name, &day, metric, now);
             match claimed {
                 Ok(true) => {
                     let text = format!("⚠️ Budget: job `{}` {detail}.", total.job_name);
@@ -426,7 +428,7 @@ async fn deliver_budget_alerts(contexts: &HashMap<String, Ctx>) {
 }
 
 async fn coordinate_channel_tasks<S>(
-    mut tasks: JoinSet<Result<&'static str>>,
+    mut tasks: JoinSet<Result<String>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown: S,
 ) -> Result<()>
@@ -472,24 +474,31 @@ impl Gateway {
             || format!("open canonical history database {}", cfg.database_path),
         )?));
         let runners = Arc::new(runners(&cfg));
-        let kind = cfg
-            .enabled_channel_kinds()?
+        let channel_id = cfg
+            .enabled_channels()?
             .into_iter()
             .next()
             .context("at least one reply channel must be enabled")?;
-        Self::new_with_shared(cfg, kind, store, history, runners, Arc::new(Mutex::new(())))
+        Self::new_with_shared(
+            cfg,
+            channel_id,
+            store,
+            history,
+            runners,
+            Arc::new(Mutex::new(())),
+        )
     }
 
     fn new_with_shared(
         cfg: Config,
-        kind: ChannelKind,
+        channel_id: ChannelId,
         store: Arc<Mutex<Store>>,
         history: Arc<Mutex<History>>,
         runners: Arc<HashMap<AgentBackend, Runner>>,
         audit_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
         let ack = Arc::new(Mutex::new(AckState::default()));
-        let channel = Channel::new_for(&cfg, kind)?;
+        let channel = Channel::new_for(&cfg, &channel_id)?;
         let audit = Arc::new(AuditLog::with_lock(
             cfg.audit_log_path.clone(),
             cfg.audit_log_content,
