@@ -571,18 +571,7 @@ fn parse_event(payload: &Value, identity: &Identity) -> Option<Event> {
 }
 
 pub fn split_text(text: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for character in text.chars() {
-        if current.chars().count() == MAX_TEXT_CHARS {
-            chunks.push(std::mem::take(&mut current));
-        }
-        current.push(character);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+    crate::chunk::split(text, MAX_TEXT_CHARS, |_| 1)
 }
 
 pub fn parse_message_target(value: &str) -> Option<(&str, &str, &str)> {
