@@ -869,7 +869,12 @@ fn complete_job(ctx: &Ctx, job: &Job, reason: &str) {
 
 /// Handles gateway-level slash commands before anything reaches the agent.
 fn command(ctx: &Ctx, job: &Job) -> Option<String> {
-    match job.text.trim().to_lowercase().as_str() {
+    let trimmed = job.text.trim();
+    // Handle /remind before lowercasing so the reminder message keeps its case.
+    if trimmed == "/remind" || trimmed.starts_with("/remind ") {
+        return Some(set_reminder(ctx, job, trimmed["/remind".len()..].trim()));
+    }
+    match trimmed.to_lowercase().as_str() {
         "/clear" | "/new" | "/reset" => match ctx.store.lock().unwrap().rotate(
             &job.thread,
             job.backend.as_str(),
@@ -882,7 +887,7 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
             Err(_) => Some("Couldn't reset the conversation.".to_string()),
         },
         "/help" => Some(
-            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/help - this message"
+            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/remind <when> <message> - remind you later (e.g. 2h or 15:00)\n/help - this message"
                 .to_string(),
         ),
         _ => None,
@@ -1025,6 +1030,69 @@ async fn run_job(ctx: &Ctx, name: &str) -> String {
         Ok((_, output)) => output,
         Err(error) => format!("Job `{name}` failed: {error}"),
     }
+}
+
+fn set_reminder(ctx: &Ctx, job: &Job, args: &str) -> String {
+    let Some((when, message)) = args.split_once(char::is_whitespace) else {
+        return "Usage: /remind <when> <message>\n<when> is a duration like 30m, 2h, 1d, or a HH:MM time.".to_string();
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        return "Usage: /remind <when> <message>".to_string();
+    }
+    let now = now_ms();
+    let Some(fire_at) = parse_when(when.trim(), now) else {
+        return format!(
+            "Couldn't understand the time {:?}. Use a duration like 2h or a HH:MM time.",
+            when.trim()
+        );
+    };
+    match ctx.history.lock().unwrap().insert_reminder(
+        ctx.channel.id(),
+        &job.target,
+        &job.thread,
+        message,
+        fire_at,
+        now,
+    ) {
+        Ok(_) => format!("⏰ Reminder set for {}.", format_local(fire_at)),
+        Err(error) => format!("Couldn't save the reminder: {error}"),
+    }
+}
+
+/// Resolves a reminder time from a duration (`30m`, `2h`, `1d`) or a `HH:MM`
+/// local time (the next occurrence today or tomorrow).
+fn parse_when(when: &str, now_ms: i64) -> Option<i64> {
+    if let Ok(duration) = humantime::parse_duration(when) {
+        let millis = i64::try_from(duration.as_millis()).ok()?;
+        return Some(now_ms.saturating_add(millis));
+    }
+    let (hours, minutes) = when.split_once(':')?;
+    let hours: u32 = hours.parse().ok()?;
+    let minutes: u32 = minutes.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    use chrono::{Local, TimeZone, Timelike};
+    let now = Local.timestamp_millis_opt(now_ms).single()?;
+    let mut target = now
+        .with_hour(hours)?
+        .with_minute(minutes)?
+        .with_second(0)?
+        .with_nanosecond(0)?;
+    if target <= now {
+        target += chrono::Duration::days(1);
+    }
+    Some(target.timestamp_millis())
+}
+
+fn format_local(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "the scheduled time".to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1327,6 +1395,7 @@ mod command_tests {
             snapshot_hash: String::new(),
             evals: Vec::new(),
             triggers,
+            notify: crate::jobs::NotifyPolicy::Always,
         }
     }
 
@@ -1424,5 +1493,42 @@ mod command_tests {
     #[test]
     fn format_status_handles_no_runs() {
         assert_eq!(format_status(&[], 0), "No job runs yet.");
+    }
+}
+
+#[cfg(test)]
+mod reminder_tests {
+    use super::{format_local, parse_when};
+
+    #[test]
+    fn parse_when_reads_durations() {
+        assert_eq!(parse_when("2h", 1_000), Some(1_000 + 7_200_000));
+        assert_eq!(parse_when("30m", 0), Some(1_800_000));
+        assert_eq!(parse_when("1d", 0), Some(86_400_000));
+    }
+
+    #[test]
+    fn parse_when_reads_hh_mm_within_next_day() {
+        let now = 1_700_000_000_000;
+        let fire = parse_when("15:30", now).unwrap();
+        assert!(fire > now, "reminder time must be in the future");
+        assert!(fire <= now + 86_400_000, "within the next 24 hours");
+        // Seconds are zeroed, so the fire time lands on a whole minute.
+        assert_eq!(fire % 60_000, 0);
+    }
+
+    #[test]
+    fn parse_when_rejects_garbage_and_out_of_range() {
+        assert_eq!(parse_when("later", 0), None);
+        assert_eq!(parse_when("25:00", 0), None);
+        assert_eq!(parse_when("12:60", 0), None);
+    }
+
+    #[test]
+    fn format_local_renders_a_timestamp() {
+        // Any valid epoch renders to a YYYY-MM-DD HH:MM string.
+        let rendered = format_local(1_700_000_000_000);
+        assert_eq!(rendered.len(), 16);
+        assert_eq!(&rendered[4..5], "-");
     }
 }

@@ -161,6 +161,14 @@ Slack primary targets use an allowlisted member ID such as `U012ABCDEF`.
 Mattermost primary targets use an allowlisted user ID for a DM, or
 `"channel:<channel-id>"` to post in a channel the bot has joined.
 
+## Reminders
+
+From any allowlisted conversation, `/remind <when> <message>` schedules a
+one-off message back to that same chat. `<when>` is a duration such as `30m`,
+`2h`, or `1d`, or a `HH:MM` local time (the next occurrence today or tomorrow).
+Reminders are stored in the conversation database and survive a restart; the
+gateway delivers each one once its time arrives. `/help` lists the command.
+
 ## Routing
 
 Routes can override the backend for a channel or exact thread:
