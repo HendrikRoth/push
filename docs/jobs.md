@@ -123,6 +123,8 @@ From an allowlisted conversation you can manage jobs without the CLI:
 - `/run <name>` — run a job now and get its result back in the same chat. This
   is a manual run: it ignores triggers, respects the per-job lock, and does not
   touch scheduled delivery.
+- `/status` — a summary of recent job runs: a 24-hour ok/failed count and the
+  most recent runs with their state and how long ago they started.
 
 `/help` lists these alongside `/clear` and `/stop`.
 

@@ -727,7 +727,7 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
             Err(_) => Some("Couldn't reset the conversation.".to_string()),
         },
         "/help" => Some(
-            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/help - this message"
+            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/help - this message"
                 .to_string(),
         ),
         _ => None,
@@ -753,7 +753,78 @@ async fn job_command(ctx: &Ctx, job: &Job) -> Option<String> {
     match name.to_ascii_lowercase().as_str() {
         "/jobs" => Some(list_jobs(ctx)),
         "/run" => Some(run_job(ctx, arg).await),
+        "/status" => Some(job_status(ctx)),
         _ => None,
+    }
+}
+
+fn job_status(ctx: &Ctx) -> String {
+    let ledger = match crate::jobs::Ledger::open(&ctx.cfg.database_path) {
+        Ok(ledger) => ledger,
+        Err(error) => return format!("Couldn't open run history: {error}"),
+    };
+    match ledger.runs(None) {
+        Ok(runs) => format_status(&runs, now_ms()),
+        Err(error) => format!("Couldn't read run history: {error}"),
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn format_status(runs: &[crate::jobs::RunRow], now_ms: i64) -> String {
+    if runs.is_empty() {
+        return "No job runs yet.".to_string();
+    }
+    let day_ago = now_ms - 24 * 60 * 60 * 1000;
+    let (mut ok, mut failed) = (0, 0);
+    for run in runs.iter().filter(|run| run.queued_at_ms >= day_ago) {
+        match run.state.as_str() {
+            "succeeded" => ok += 1,
+            "failed" | "timed_out" => failed += 1,
+            _ => {}
+        }
+    }
+    let mut lines = vec![
+        format!("Last 24h: {ok} ok, {failed} failed"),
+        "Recent runs:".to_string(),
+    ];
+    for run in runs.iter().take(8) {
+        lines.push(format!(
+            "{} {} — {} ({})",
+            state_icon(&run.state),
+            run.job_name,
+            run.state,
+            relative_time(now_ms - run.queued_at_ms)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn state_icon(state: &str) -> &'static str {
+    match state {
+        "succeeded" => "✅",
+        "failed" | "timed_out" => "⚠️",
+        "running" => "⏳",
+        "queued" => "•",
+        _ => "◦",
+    }
+}
+
+fn relative_time(ms_ago: i64) -> String {
+    let seconds = ms_ago.max(0) / 1000;
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
     }
 }
 
@@ -1093,5 +1164,58 @@ mod command_tests {
             errors: Vec::new(),
         };
         assert_eq!(format_jobs(&catalog), "No jobs are defined.");
+    }
+
+    fn run_row(name: &str, state: &str, queued_at_ms: i64) -> crate::jobs::RunRow {
+        crate::jobs::RunRow {
+            id: "id".to_string(),
+            job_name: name.to_string(),
+            state: state.to_string(),
+            backend: "codex".to_string(),
+            queued_at_ms,
+            result: None,
+            error: None,
+            evaluation_state: "not_requested".to_string(),
+            evaluation_result: None,
+            evaluation_error: None,
+            trigger_kind: "cron".to_string(),
+            trigger_id: None,
+            scheduled_at_ms: None,
+            delivery_state: "not_requested".to_string(),
+            delivery_attempts: 0,
+            delivery_error: None,
+            delivery_channel: None,
+            delivery_target: None,
+        }
+    }
+
+    #[test]
+    fn relative_time_scales_by_unit() {
+        assert_eq!(relative_time(5_000), "5s ago");
+        assert_eq!(relative_time(120_000), "2m ago");
+        assert_eq!(relative_time(7_200_000), "2h ago");
+        assert_eq!(relative_time(3 * 86_400_000), "3d ago");
+        assert_eq!(relative_time(-1000), "0s ago");
+    }
+
+    #[test]
+    fn format_status_summarizes_recent_runs() {
+        let now = 100 * 86_400_000;
+        let runs = [
+            run_row("alpha", "succeeded", now - 60_000),
+            run_row("beta", "failed", now - 3_600_000),
+            run_row("gamma", "timed_out", now - 2 * 86_400_000), // outside 24h
+        ];
+        let status = format_status(&runs, now);
+        // Only runs within 24h count toward the summary.
+        assert!(status.contains("Last 24h: 1 ok, 1 failed"));
+        assert!(status.contains("✅ alpha — succeeded (1m ago)"));
+        assert!(status.contains("⚠️ beta — failed (1h ago)"));
+        assert!(status.contains("gamma — timed_out (2d ago)"));
+    }
+
+    #[test]
+    fn format_status_handles_no_runs() {
+        assert_eq!(format_status(&[], 0), "No job runs yet.");
     }
 }
