@@ -18,7 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::channel::{InboundFile, OutboundFile, RawMessage};
 
@@ -295,11 +295,8 @@ impl Mattermost {
             )
             .await
         {
-            Ok(value) => {
-                warn!(
-                    "mattermost working reaction on post {post_id} added as {} (bot user {}): {value}",
-                    WORKING_EMOJI, identity.user_id
-                );
+            Ok(_) => {
+                debug!("mattermost working reaction added on post {post_id}");
                 self.state.reacted.lock().unwrap().insert(post_id.to_string());
             }
             Err(error) => {
