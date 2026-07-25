@@ -870,7 +870,13 @@ fn complete_job(ctx: &Ctx, job: &Job, reason: &str) {
 /// Handles gateway-level slash commands before anything reaches the agent.
 fn command(ctx: &Ctx, job: &Job) -> Option<String> {
     let trimmed = job.text.trim();
-    // Handle /remind before lowercasing so the reminder message keeps its case.
+    // Handle reminder commands before lowercasing so messages keep their case.
+    if trimmed.eq_ignore_ascii_case("/reminders") {
+        return Some(list_reminders(ctx, job));
+    }
+    if trimmed == "/reminder" || trimmed.starts_with("/reminder ") {
+        return Some(reminder_command(ctx, job, trimmed["/reminder".len()..].trim()));
+    }
     if trimmed == "/remind" || trimmed.starts_with("/remind ") {
         return Some(set_reminder(ctx, job, trimmed["/remind".len()..].trim()));
     }
@@ -887,7 +893,7 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
             Err(_) => Some("Couldn't reset the conversation.".to_string()),
         },
         "/help" => Some(
-            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/remind <when> <message> - remind you later (e.g. 2h or 15:00)\n/help - this message"
+            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/remind <when> <message> - remind you later (2h, 15:00, or daily 09:00)\n/reminders - list pending reminders\n/reminder cancel <id> - cancel a reminder\n/help - this message"
                 .to_string(),
         ),
         _ => None,
@@ -1032,19 +1038,32 @@ async fn run_job(ctx: &Ctx, name: &str) -> String {
     }
 }
 
+const REMIND_USAGE: &str = "Usage: /remind <when> <message>\n<when> is a duration (30m, 2h, 1d), a HH:MM time, or `daily`/`weekdays` HH:MM.";
+
 fn set_reminder(ctx: &Ctx, job: &Job, args: &str) -> String {
-    let Some((when, message)) = args.split_once(char::is_whitespace) else {
-        return "Usage: /remind <when> <message>\n<when> is a duration like 30m, 2h, 1d, or a HH:MM time.".to_string();
+    let Some((first, rest)) = args.split_once(char::is_whitespace) else {
+        return REMIND_USAGE.to_string();
     };
-    let message = message.trim();
+    let first_lower = first.to_ascii_lowercase();
+    let (recurrence, when, message) = if first_lower == "daily" || first_lower == "weekdays" {
+        let Some((when, message)) = rest.trim().split_once(char::is_whitespace) else {
+            return REMIND_USAGE.to_string();
+        };
+        (first_lower.as_str(), when.trim(), message.trim())
+    } else {
+        ("", first, rest.trim())
+    };
     if message.is_empty() {
-        return "Usage: /remind <when> <message>".to_string();
+        return REMIND_USAGE.to_string();
+    }
+    if !recurrence.is_empty() && !when.contains(':') {
+        return "Recurring reminders need a HH:MM time, e.g. /remind daily 09:00 <message>."
+            .to_string();
     }
     let now = now_ms();
-    let Some(fire_at) = parse_when(when.trim(), now) else {
+    let Some(fire_at) = parse_when(when, now) else {
         return format!(
-            "Couldn't understand the time {:?}. Use a duration like 2h or a HH:MM time.",
-            when.trim()
+            "Couldn't understand the time {when:?}. Use a duration like 2h or a HH:MM time."
         );
     };
     match ctx.history.lock().unwrap().insert_reminder(
@@ -1053,10 +1072,78 @@ fn set_reminder(ctx: &Ctx, job: &Job, args: &str) -> String {
         &job.thread,
         message,
         fire_at,
+        recurrence,
         now,
     ) {
-        Ok(_) => format!("⏰ Reminder set for {}.", format_local(fire_at)),
+        Ok(_) if recurrence.is_empty() => {
+            format!("⏰ Reminder set for {}.", format_local(fire_at))
+        }
+        Ok(_) => format!(
+            "⏰ Recurring reminder ({recurrence}) set, next at {}.",
+            format_local(fire_at)
+        ),
         Err(error) => format!("Couldn't save the reminder: {error}"),
+    }
+}
+
+fn list_reminders(ctx: &Ctx, job: &Job) -> String {
+    let pending = match ctx.history.lock().unwrap().pending_reminders(&job.thread) {
+        Ok(pending) => pending,
+        Err(error) => return format!("Couldn't read reminders: {error}"),
+    };
+    if pending.is_empty() {
+        return "No pending reminders.".to_string();
+    }
+    let mut lines = vec!["Pending reminders:".to_string()];
+    for reminder in pending {
+        let recurrence = if reminder.recurrence.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", reminder.recurrence)
+        };
+        lines.push(format!(
+            "#{} · {}{recurrence} · {}",
+            reminder.id,
+            format_local(reminder.fire_at_ms),
+            reminder.message
+        ));
+    }
+    lines.push("Cancel with /reminder cancel <id>.".to_string());
+    lines.join("\n")
+}
+
+fn reminder_command(ctx: &Ctx, job: &Job, args: &str) -> String {
+    let (verb, rest) = args
+        .split_once(char::is_whitespace)
+        .unwrap_or((args, ""));
+    if !verb.eq_ignore_ascii_case("cancel") {
+        return "Usage: /reminder cancel <id>".to_string();
+    }
+    let Ok(id) = rest.trim().parse::<i64>() else {
+        return "Usage: /reminder cancel <id>".to_string();
+    };
+    match ctx.history.lock().unwrap().cancel_reminder(id, &job.thread) {
+        Ok(true) => format!("Cancelled reminder #{id}."),
+        Ok(false) => format!("No pending reminder #{id} in this chat."),
+        Err(error) => format!("Couldn't cancel the reminder: {error}"),
+    }
+}
+
+/// Computes the next fire time for a recurring reminder, or None for a one-off
+/// or unknown recurrence.
+pub(super) fn next_recurrence(fire_at_ms: i64, recurrence: &str) -> Option<i64> {
+    use chrono::{Datelike, Duration, Local, TimeZone, Weekday};
+    let current = Local.timestamp_millis_opt(fire_at_ms).single()?;
+    let mut next = current + Duration::days(1);
+    match recurrence {
+        "daily" => Some(next.timestamp_millis()),
+        "weekdays" => {
+            while matches!(next.weekday(), Weekday::Sat | Weekday::Sun) {
+                next += Duration::days(1);
+            }
+            Some(next.timestamp_millis())
+        }
+        _ => None,
     }
 }
 
@@ -1530,5 +1617,22 @@ mod reminder_tests {
         let rendered = format_local(1_700_000_000_000);
         assert_eq!(rendered.len(), 16);
         assert_eq!(&rendered[4..5], "-");
+    }
+
+    #[test]
+    fn next_recurrence_advances_daily_and_skips_weekends() {
+        use super::next_recurrence;
+        use chrono::{Datelike, Local, TimeZone, Weekday};
+
+        let base = 1_700_000_000_000;
+        assert_eq!(next_recurrence(base, "daily"), Some(base + 86_400_000));
+        assert_eq!(next_recurrence(base, ""), None);
+        assert_eq!(next_recurrence(base, "monthly"), None);
+
+        let weekday_next = next_recurrence(base, "weekdays").unwrap();
+        assert!(weekday_next >= base + 86_400_000);
+        assert!(weekday_next <= base + 3 * 86_400_000);
+        let day = Local.timestamp_millis_opt(weekday_next).single().unwrap().weekday();
+        assert!(!matches!(day, Weekday::Sat | Weekday::Sun));
     }
 }

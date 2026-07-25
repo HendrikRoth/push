@@ -164,10 +164,16 @@ Mattermost primary targets use an allowlisted user ID for a DM, or
 ## Reminders
 
 From any allowlisted conversation, `/remind <when> <message>` schedules a
-one-off message back to that same chat. `<when>` is a duration such as `30m`,
-`2h`, or `1d`, or a `HH:MM` local time (the next occurrence today or tomorrow).
+message back to that same chat. `<when>` is a duration such as `30m`, `2h`, or
+`1d`, a `HH:MM` local time (the next occurrence today or tomorrow), or a
+recurring `daily HH:MM` / `weekdays HH:MM`. Recurring reminders re-arm for their
+next occurrence after each delivery.
+
+- `/reminders` — list pending reminders for the chat, with their id and time.
+- `/reminder cancel <id>` — cancel a pending reminder in that chat.
+
 Reminders are stored in the conversation database and survive a restart; the
-gateway delivers each one once its time arrives. `/help` lists the command.
+gateway delivers each one once its time arrives. `/help` lists the commands.
 
 ## Routing
 
