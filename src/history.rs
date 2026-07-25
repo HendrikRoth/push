@@ -12,7 +12,7 @@ use crate::approval::{parse_answer, AnswerOrigin, AnswerOutcome, NormalizedAnswe
 #[cfg(test)]
 use crate::approval::{DeliveryStatus as ApprovalDeliveryStatus, Question};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
 const READ_TRUNCATED: &str = "\n[truncated by push while reading history]";
@@ -85,6 +85,14 @@ impl ConversationRole {
 pub struct ConversationMessage {
     pub role: ConversationRole,
     pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reminder {
+    pub id: i64,
+    pub channel: String,
+    pub target: String,
+    pub message: String,
 }
 
 pub struct History {
@@ -204,6 +212,52 @@ impl History {
         tx.commit()
             .with_context(|| format!("commit stop target to {database_path}"))?;
         Ok(target_row_id)
+    }
+
+    pub fn insert_reminder(
+        &mut self,
+        channel: &str,
+        target: &str,
+        thread: &str,
+        message: &str,
+        fire_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO reminders (channel, target, thread, message, fire_at_ms, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![channel, target, thread, message, fire_at_ms, now_ms],
+            )
+            .context("insert reminder")?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn due_reminders(&self, now_ms: i64) -> Result<Vec<Reminder>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, channel, target, message FROM reminders
+             WHERE delivered = 0 AND fire_at_ms <= ?1
+             ORDER BY fire_at_ms, id",
+        )?;
+        let rows = statement
+            .query_map([now_ms], |row| {
+                Ok(Reminder {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    target: row.get(2)?,
+                    message: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read due reminders")?;
+        Ok(rows)
+    }
+
+    pub fn mark_reminder_delivered(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE reminders SET delivered = 1 WHERE id = ?1", [id])
+            .context("mark reminder delivered")?;
+        Ok(())
     }
 
     pub fn replace_inbound_content(&mut self, inbound_id: i64, content: &str) -> Result<()> {
@@ -825,6 +879,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         conn.execute_batch("PRAGMA user_version = 10;")?;
     }
+    if version <= 10 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS reminders (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 channel TEXT NOT NULL,
+                 target TEXT NOT NULL,
+                 thread TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 fire_at_ms INTEGER NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 delivered INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS reminders_due_idx ON reminders(delivered, fire_at_ms);
+             PRAGMA user_version = 11;",
+        )?;
+    }
     conn.execute_batch("COMMIT;")?;
     Ok(())
 }
@@ -872,6 +942,31 @@ mod tests {
     use super::*;
     use crate::approval::{Choice, Question};
     use crate::test_support::temp_path;
+
+    #[test]
+    fn reminders_fire_once_after_their_time() {
+        let path = temp_path("reminders");
+        let mut history = History::open(path.to_str().unwrap()).unwrap();
+        let id = history
+            .insert_reminder("mattermost", "C1|root", "mattermost:ch:C1:root", "call mum", 5_000, 0)
+            .unwrap();
+
+        // Not due yet.
+        assert!(history.due_reminders(4_999).unwrap().is_empty());
+
+        // Due at its time; carries the delivery routing.
+        let due = history.due_reminders(5_000).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+        assert_eq!(due[0].channel, "mattermost");
+        assert_eq!(due[0].target, "C1|root");
+        assert_eq!(due[0].message, "call mum");
+
+        // Delivered reminders do not fire again.
+        history.mark_reminder_delivered(id).unwrap();
+        assert!(history.due_reminders(10_000).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
 
     fn question(expires_at_ms: i64) -> Question {
         Question::new(

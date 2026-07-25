@@ -146,6 +146,14 @@ must be enabled and the target must appear in that channel's allowlist.
 Telegram topic targets use `"<chat-id>:<topic-id>"`.
 Slack primary targets use an allowlisted member ID such as `U012ABCDEF`.
 
+## Reminders
+
+From any allowlisted conversation, `/remind <when> <message>` schedules a
+one-off message back to that same chat. `<when>` is a duration such as `30m`,
+`2h`, or `1d`, or a `HH:MM` local time (the next occurrence today or tomorrow).
+Reminders are stored in the conversation database and survive a restart; the
+gateway delivers each one once its time arrives. `/help` lists the command.
+
 ## Routing
 
 Routes can override the backend for a channel or exact thread:

@@ -253,9 +253,9 @@ async fn run_scheduler(
                 }
             }
             _ = ticker.tick() => {
-                let contexts = contexts.clone();
+                let tick_contexts = contexts.clone();
                 if let Err(error) = scheduler.tick(now_ms(), move |channel, target, text, start_chunk, progress| {
-                    let contexts = contexts.clone();
+                    let contexts = tick_contexts.clone();
                     async move {
                         let Some(ctx) = contexts.get(&channel) else {
                             return jobs::DeliveryAttempt::failed(
@@ -279,11 +279,43 @@ async fn run_scheduler(
                 }).await {
                     error!("job scheduler tick failed: {error:#}");
                 }
+                deliver_due_reminders(&contexts).await;
             }
         }
     }
     scheduler.shutdown().await;
     Ok(())
+}
+
+/// Delivers reminders whose time has arrived back to the chat that set them.
+/// A delivery failure leaves the reminder pending for the next tick.
+async fn deliver_due_reminders(contexts: &HashMap<String, Ctx>) {
+    let Some(any) = contexts.values().next() else {
+        return;
+    };
+    let due = match any.history.lock().unwrap().due_reminders(now_ms()) {
+        Ok(due) => due,
+        Err(error) => {
+            warn!("read due reminders: {error:#}");
+            return;
+        }
+    };
+    for reminder in due {
+        let Some(ctx) = contexts.get(&reminder.channel) else {
+            continue;
+        };
+        let text = format!("⏰ Reminder: {}", reminder.message);
+        if reply_to(ctx, &reminder.target, &text).await {
+            if let Err(error) = ctx
+                .history
+                .lock()
+                .unwrap()
+                .mark_reminder_delivered(reminder.id)
+            {
+                warn!("mark reminder {} delivered: {error:#}", reminder.id);
+            }
+        }
+    }
 }
 
 async fn coordinate_channel_tasks<S>(
