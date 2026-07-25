@@ -892,11 +892,79 @@ fn command(ctx: &Ctx, job: &Job) -> Option<String> {
             Ok(()) => Some("Started a fresh conversation.".to_string()),
             Err(_) => Some("Couldn't reset the conversation.".to_string()),
         },
+        "/usage" => Some(usage_report(ctx)),
         "/help" => Some(
-            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/remind <when> <message> - remind you later (2h, 15:00, or daily 09:00)\n/reminders - list pending reminders\n/reminder cancel <id> - cancel a reminder\n/help - this message"
+            "Commands:\n/clear - start a fresh conversation\n/stop - stop the active request\n/jobs - list configured jobs\n/run <name> - run a job now\n/status - recent job runs\n/usage - token, cost and time per job\n/remind <when> <message> - remind you later (2h, 15:00, or daily 09:00)\n/reminders - list pending reminders\n/reminder cancel <id> - cancel a reminder\n/help - this message"
                 .to_string(),
         ),
         _ => None,
+    }
+}
+
+/// Builds the `/usage` reply: consumption aggregated per job runbook.
+fn usage_report(ctx: &Ctx) -> String {
+    let ledger = match crate::jobs::Ledger::open(&ctx.cfg.database_path) {
+        Ok(ledger) => ledger,
+        Err(error) => return format!("Couldn't open usage: {error}"),
+    };
+    match ledger.usage_summary() {
+        Ok(summaries) => format_usage(&summaries),
+        Err(error) => format!("Couldn't read usage: {error}"),
+    }
+}
+
+fn format_usage(summaries: &[crate::jobs::UsageSummary]) -> String {
+    if summaries.is_empty() {
+        return "No job usage recorded yet.".to_string();
+    }
+    let mut lines = vec!["Usage per job:".to_string()];
+    for s in summaries {
+        let backend = match s.backend.as_str() {
+            "claude" => "Claude",
+            "codex" => "Codex",
+            "pi" => "Pi",
+            other => other,
+        };
+        let tokens = s.input_tokens + s.output_tokens;
+        let mut line = format!(
+            "{} ({backend}): {} runs, {} tokens (in {} / out {})",
+            s.job_name,
+            s.runs,
+            format_count(tokens),
+            format_count(s.input_tokens),
+            format_count(s.output_tokens),
+        );
+        if s.cost_usd > 0.0 {
+            line.push_str(&format!(", ${:.2}", s.cost_usd));
+        }
+        if s.duration_ms > 0 {
+            line.push_str(&format!(", {}", format_duration(s.duration_ms)));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// Human-readable total run time (no "ago" suffix, unlike `relative_time`).
+fn format_duration(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+/// Compact thousands/millions formatting for token counts.
+fn format_count(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 
@@ -1503,6 +1571,58 @@ mod command_tests {
         assert_eq!(parse_slash("/run a b"), Some(("/run", "a b")));
         assert_eq!(parse_slash("hello"), None);
         assert_eq!(parse_slash(""), None);
+    }
+
+    #[test]
+    fn format_usage_reports_per_job_totals() {
+        use crate::jobs::UsageSummary;
+        let summaries = vec![
+            UsageSummary {
+                job_name: "daily-triage".to_string(),
+                backend: "claude".to_string(),
+                runs: 3,
+                input_tokens: 1_500,
+                output_tokens: 500,
+                cost_usd: 0.42,
+                duration_ms: 125_000,
+            },
+            UsageSummary {
+                job_name: "cve-check".to_string(),
+                backend: "codex".to_string(),
+                runs: 1,
+                input_tokens: 800,
+                output_tokens: 200,
+                cost_usd: 0.0,
+                duration_ms: 4_000,
+            },
+        ];
+
+        let report = format_usage(&summaries);
+        assert!(report.contains("daily-triage (Claude): 3 runs, 2.0k tokens (in 1.5k / out 500)"));
+        assert!(report.contains("$0.42"));
+        assert!(report.contains("2m 5s"));
+        assert!(report.contains("cve-check (Codex): 1 runs, 1.0k tokens (in 800 / out 200)"));
+        // Codex reports no cost, so no dollar figure is shown for it.
+        assert!(!report.lines().any(|l| l.contains("cve-check") && l.contains('$')));
+    }
+
+    #[test]
+    fn format_usage_handles_no_recorded_runs() {
+        assert_eq!(format_usage(&[]), "No job usage recorded yet.");
+    }
+
+    #[test]
+    fn format_count_scales_by_magnitude() {
+        assert_eq!(format_count(42), "42");
+        assert_eq!(format_count(1_500), "1.5k");
+        assert_eq!(format_count(2_300_000), "2.3M");
+    }
+
+    #[test]
+    fn format_duration_omits_ago_suffix() {
+        assert_eq!(format_duration(5_000), "5s");
+        assert_eq!(format_duration(125_000), "2m 5s");
+        assert_eq!(format_duration(3_720_000), "1h 2m");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::agent::{final_reply, Request, RunError, RunOutput};
+use crate::agent::{final_reply, Request, RunError, RunOutput, Usage};
 use crate::util::non_empty_session_id;
 
 /// Runner invokes the `claude` binary in print mode.
@@ -30,6 +30,36 @@ struct CliResult {
     is_error: bool,
     #[serde(default)]
     subtype: String,
+    #[serde(default)]
+    usage: CliUsage,
+    #[serde(default)]
+    total_cost_usd: f64,
+}
+
+/// Claude reports cache reads/creations separately from fresh input tokens; we
+/// fold them all into the input side so the total reflects real consumption.
+#[derive(Deserialize, Default)]
+struct CliUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+impl CliResult {
+    fn to_usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.usage.input_tokens
+                + self.usage.cache_creation_input_tokens
+                + self.usage.cache_read_input_tokens,
+            output_tokens: self.usage.output_tokens,
+            cost_usd: self.total_cost_usd,
+        }
+    }
 }
 
 impl Runner {
@@ -128,12 +158,14 @@ impl Runner {
             Ok(r) => Ok(RunOutput {
                 reply: final_reply("claude", &r.result)?,
                 session_id: non_empty_session_id(&r.session_id).map(str::to_string),
+                usage: r.to_usage(),
             }),
             Err(_) => {
                 if out.status.success() {
                     Ok(RunOutput {
                         reply: final_reply("claude", &String::from_utf8_lossy(&out.stdout))?,
                         session_id: None,
+                        usage: Usage::default(),
                     })
                 } else {
                     let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -174,6 +206,30 @@ mod tests {
         {
             Box::pin(self.run(req, timeout))
         }
+    }
+
+    #[test]
+    fn folds_cache_tokens_into_input_and_keeps_cost() {
+        let json = r#"{
+            "result":"hi","session_id":"s","total_cost_usd":0.1234,
+            "usage":{"input_tokens":100,"output_tokens":40,
+                     "cache_creation_input_tokens":10,"cache_read_input_tokens":5}
+        }"#;
+        let parsed: CliResult = serde_json::from_str(json).unwrap();
+        let usage = parsed.to_usage();
+        assert_eq!(usage.input_tokens, 115);
+        assert_eq!(usage.output_tokens, 40);
+        assert!((usage.cost_usd - 0.1234).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_usage_defaults_to_zero() {
+        let parsed: CliResult =
+            serde_json::from_str(r#"{"result":"hi","session_id":"s"}"#).unwrap();
+        let usage = parsed.to_usage();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cost_usd, 0.0);
     }
 
     #[test]

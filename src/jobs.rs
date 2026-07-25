@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::agent::{Request, RunError, Runner};
+use crate::agent::{Request, RunError, Runner, Usage};
 use crate::config::{AgentBackend, Config};
 use crate::util::{expand_home, now_ms, restrict_permissions, same_file};
 use crate::{history::History, soul};
@@ -674,6 +674,18 @@ pub struct Ledger {
     conn: Connection,
 }
 
+/// Aggregated agent consumption for one job runbook across all its runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageSummary {
+    pub job_name: String,
+    pub backend: String,
+    pub runs: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+    pub duration_ms: i64,
+}
+
 #[derive(Debug)]
 pub struct RunRow {
     pub id: String,
@@ -789,6 +801,59 @@ impl Ledger {
         let conn = Connection::open(database_path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Self { conn })
+    }
+
+    /// Appends one completed run's consumption for `job_name`. Best-effort
+    /// accounting: token counts are zero when a backend does not report them.
+    pub fn record_usage(
+        &mut self,
+        job_name: &str,
+        backend: &str,
+        usage: &Usage,
+        duration_ms: i64,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO job_usage
+                (job_name, backend, input_tokens, output_tokens, cost_usd, duration_ms, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                job_name,
+                backend,
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                usage.cost_usd,
+                duration_ms,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Totals consumption per job runbook, most-consuming first, for `/usage`.
+    pub fn usage_summary(&self) -> Result<Vec<UsageSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_name, backend, COUNT(*), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost_usd), 0),
+                    COALESCE(SUM(duration_ms), 0)
+             FROM job_usage
+             GROUP BY job_name, backend
+             ORDER BY SUM(input_tokens + output_tokens) DESC, job_name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UsageSummary {
+                    job_name: row.get(0)?,
+                    backend: row.get(1)?,
+                    runs: row.get(2)?,
+                    input_tokens: row.get(3)?,
+                    output_tokens: row.get(4)?,
+                    cost_usd: row.get(5)?,
+                    duration_ms: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn start_manual(&mut self, cfg: &Config, job: &Job) -> Result<StartOutcome> {
@@ -1753,7 +1818,16 @@ async fn run_scheduled(cfg: Config, queued: QueuedRun) -> Result<()> {
         return Ok(());
     };
     match execute(&cfg, &job).await {
-        Ok(reply) => {
+        Ok(Executed {
+            reply,
+            usage,
+            duration_ms,
+        }) => {
+            if let Err(error) =
+                ledger.record_usage(&job.name, job.backend.as_str(), &usage, duration_ms, now_ms())
+            {
+                tracing::warn!("job {} failed to record usage: {error}", job.name);
+            }
             if !job.evals.is_empty() {
                 ledger.record_execution_result(&run_id, &reply)?;
             }
@@ -1825,7 +1899,16 @@ pub async fn run_manual(cfg: &Config, job: Job) -> Result<(String, String)> {
     };
 
     match execute(cfg, &job).await {
-        Ok(reply) => {
+        Ok(Executed {
+            reply,
+            usage,
+            duration_ms,
+        }) => {
+            if let Err(error) =
+                ledger.record_usage(&job.name, job.backend.as_str(), &usage, duration_ms, now_ms())
+            {
+                tracing::warn!("job {} failed to record usage: {error}", job.name);
+            }
             if !job.evals.is_empty() {
                 ledger.record_execution_result(&run_id, &reply)?;
             }
@@ -1990,7 +2073,14 @@ pub(crate) fn format_evaluation_detail(result: Option<&str>, error: Option<&str>
     }
 }
 
-async fn execute(cfg: &Config, job: &Job) -> std::result::Result<String, ExecutionError> {
+/// A successful job run: the reply plus the agent consumption it incurred.
+struct Executed {
+    reply: String,
+    usage: Usage,
+    duration_ms: i64,
+}
+
+async fn execute(cfg: &Config, job: &Job) -> std::result::Result<Executed, ExecutionError> {
     let current_workdir = std::fs::canonicalize(&job.workdir)
         .map_err(|error| ExecutionError::Failed(format!("recheck job workdir: {error}")))?;
     if current_workdir != job.workdir {
@@ -2019,8 +2109,13 @@ async fn execute(cfg: &Config, job: &Job) -> std::result::Result<String, Executi
         workdir,
         humantime::format_duration(job.timeout),
     );
+    let started = Instant::now();
     match runner.run_unattended(request, job.timeout).await {
-        Ok(output) => Ok(output.reply),
+        Ok(output) => Ok(Executed {
+            reply: output.reply,
+            usage: output.usage,
+            duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        }),
         Err(RunError::Timeout) => Err(ExecutionError::Timeout),
         Err(RunError::Failed(error) | RunError::SessionMissing(error)) => {
             Err(ExecutionError::Failed(format!("backend: {error}")))
@@ -2142,6 +2237,70 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn usage_summary_aggregates_per_job_most_consuming_first() {
+        let database = temp_path("job-usage");
+        let mut ledger = Ledger::open(database.to_str().unwrap()).unwrap();
+
+        let claude = Usage {
+            input_tokens: 1_000,
+            output_tokens: 400,
+            cost_usd: 0.10,
+        };
+        ledger
+            .record_usage("daily-triage", "claude", &claude, 5_000, 1)
+            .unwrap();
+        ledger
+            .record_usage(
+                "daily-triage",
+                "claude",
+                &Usage {
+                    input_tokens: 200,
+                    output_tokens: 100,
+                    cost_usd: 0.05,
+                },
+                3_000,
+                2,
+            )
+            .unwrap();
+        ledger
+            .record_usage(
+                "cve-check",
+                "codex",
+                &Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cost_usd: 0.0,
+                },
+                2_000,
+                3,
+            )
+            .unwrap();
+
+        let summary = ledger.usage_summary().unwrap();
+        assert_eq!(summary.len(), 2);
+        // daily-triage consumed the most tokens, so it ranks first.
+        let triage = &summary[0];
+        assert_eq!(triage.job_name, "daily-triage");
+        assert_eq!(triage.backend, "claude");
+        assert_eq!(triage.runs, 2);
+        assert_eq!(triage.input_tokens, 1_200);
+        assert_eq!(triage.output_tokens, 500);
+        assert!((triage.cost_usd - 0.15).abs() < 1e-9);
+        assert_eq!(triage.duration_ms, 8_000);
+
+        let cve = &summary[1];
+        assert_eq!(cve.job_name, "cve-check");
+        assert_eq!(cve.runs, 1);
+    }
+
+    #[test]
+    fn usage_summary_is_empty_without_recorded_runs() {
+        let database = temp_path("job-usage-empty");
+        let ledger = Ledger::open(database.to_str().unwrap()).unwrap();
+        assert!(ledger.usage_summary().unwrap().is_empty());
     }
 
     #[cfg(unix)]

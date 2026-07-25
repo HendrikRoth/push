@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::agent::{final_reply, Request, RunError, RunOutput};
+use crate::agent::{final_reply, Request, RunError, RunOutput, Usage};
 
 /// Runner invokes `pi` in non-interactive JSON event mode.
 pub struct Runner {
@@ -89,6 +89,7 @@ impl Runner {
         Ok(RunOutput {
             reply: final_reply("pi", &reply)?,
             session_id: req.is_new.then_some(parsed.session_id).flatten(),
+            usage: parsed.usage,
         })
     }
 
@@ -124,6 +125,7 @@ struct ParsedOutput {
     session_id: Option<String>,
     reply: Option<String>,
     assistant_failed: bool,
+    usage: Usage,
 }
 
 fn parse_jsonl(stdout: &[u8]) -> Result<ParsedOutput, String> {
@@ -168,6 +170,11 @@ fn parse_jsonl(stdout: &[u8]) -> Result<ParsedOutput, String> {
                     .join("");
                 parsed.reply = Some(text);
                 parsed.assistant_failed = false;
+                if let Some(usage) = message.get("usage") {
+                    let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+                    parsed.usage.input_tokens += field("input_tokens");
+                    parsed.usage.output_tokens += field("output_tokens");
+                }
             }
             _ => {}
         }
@@ -212,6 +219,28 @@ mod tests {
         {
             Box::pin(self.run(req, timeout))
         }
+    }
+
+    #[test]
+    fn parses_usage_from_assistant_message_end() {
+        let stdout = concat!(
+            r#"{"type":"session","id":"s1"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":123,"output_tokens":45}}}"#,
+        );
+        let parsed = parse_jsonl(stdout.as_bytes()).unwrap();
+        assert_eq!(parsed.reply.as_deref(), Some("hi"));
+        assert_eq!(parsed.usage.input_tokens, 123);
+        assert_eq!(parsed.usage.output_tokens, 45);
+        assert_eq!(parsed.usage.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn usage_defaults_to_zero_without_usage_field() {
+        let stdout = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
+        let parsed = parse_jsonl(stdout.as_bytes()).unwrap();
+        assert_eq!(parsed.usage.input_tokens, 0);
+        assert_eq!(parsed.usage.output_tokens, 0);
     }
 
     #[tokio::test]
