@@ -60,7 +60,6 @@ pub fn test_config() -> crate::config::Config {
         mattermost_url: None,
         mattermost_token: None,
         mattermost_allow_user_ids: Vec::new(),
-        mattermost: Vec::new(),
         voice_openai_api_key: None,
         voice_name: crate::config::DEFAULT_VOICE_NAME.to_string(),
         agent: "codex".to_string(),

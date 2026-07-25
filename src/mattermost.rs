@@ -51,9 +51,6 @@ pub struct Mattermost {
 }
 
 struct State {
-    /// Channel identity: "mattermost" for the legacy single bot, else
-    /// "mattermost:<name>". Used for cursors, thread keys, and addressing.
-    id: String,
     token: String,
     base_url: String,
     websocket_url: String,
@@ -156,22 +153,16 @@ impl Drop for ReceiverTask {
 
 impl Mattermost {
     pub fn new(
-        id: String,
         base_url: String,
         token: String,
         allow_user_ids: Vec<String>,
         state_path: &str,
     ) -> Result<Self> {
-        // Each bot keeps its own inbox database so instances on the same server
-        // never share dedup state. The legacy single bot (id "mattermost")
-        // keeps its historical `.mattermost-inbox.db` path unchanged.
-        let slug = id.replace(':', "-");
-        let inbox_path = format!("{state_path}.{slug}-inbox.db");
-        Self::with_inbox(id, base_url, token, allow_user_ids, &inbox_path)
+        let inbox_path = format!("{state_path}.mattermost-inbox.db");
+        Self::with_inbox(base_url, token, allow_user_ids, &inbox_path)
     }
 
     fn with_inbox(
-        id: String,
         base_url: String,
         token: String,
         allow_user_ids: Vec<String>,
@@ -181,7 +172,6 @@ impl Mattermost {
         let websocket_url = websocket_url(&base_url);
         Ok(Self {
             state: Arc::new(State {
-                id,
                 token,
                 base_url,
                 websocket_url,
@@ -211,11 +201,6 @@ impl Mattermost {
 
     pub fn allows_user(&self, user: &str) -> bool {
         self.state.allow_user_ids.contains(user.trim())
-    }
-
-    /// This bot's channel identity, e.g. "mattermost" or "mattermost:work".
-    pub fn channel_id(&self) -> &str {
-        &self.state.id
     }
 
     pub async fn poll(&self, since: i64) -> Result<Vec<RawMessage>> {
@@ -304,11 +289,7 @@ impl Mattermost {
             .await
             .is_ok();
         if posted {
-            self.state
-                .reacted
-                .lock()
-                .unwrap()
-                .insert(post_id.to_string());
+            self.state.reacted.lock().unwrap().insert(post_id.to_string());
         }
     }
 
@@ -348,10 +329,7 @@ impl Mattermost {
     /// Downloads an attachment's bytes, refusing anything over the size cap.
     pub async fn download_file(&self, file: &InboundFile) -> Result<Vec<u8>> {
         if file.size.is_some_and(|size| size > MAX_FILE_BYTES) {
-            bail!(
-                "Mattermost attachment {:?} exceeds the size limit",
-                file.filename
-            );
+            bail!("Mattermost attachment {:?} exceeds the size limit", file.filename);
         }
         let url = format!("{}/api/v4/files/{}", self.state.base_url, file.locator);
         let response = self
@@ -373,10 +351,7 @@ impl Mattermost {
             .await
             .context("read Mattermost attachment bytes")?;
         if bytes.len() > MAX_FILE_BYTES {
-            bail!(
-                "Mattermost attachment {:?} exceeds the size limit",
-                file.filename
-            );
+            bail!("Mattermost attachment {:?} exceeds the size limit", file.filename);
         }
         Ok(bytes.to_vec())
     }
@@ -463,13 +438,10 @@ impl State {
     /// Uploads one file to a channel and returns its new Mattermost file id.
     async fn upload_file(&self, channel_id: &str, file: &OutboundFile) -> Result<String> {
         if file.bytes.len() > MAX_FILE_BYTES {
-            bail!(
-                "Mattermost upload {:?} exceeds the size limit",
-                file.filename
-            );
+            bail!("Mattermost upload {:?} exceeds the size limit", file.filename);
         }
-        let part =
-            reqwest::multipart::Part::bytes(file.bytes.clone()).file_name(file.filename.clone());
+        let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+            .file_name(file.filename.clone());
         let form = reqwest::multipart::Form::new()
             .text("channel_id", channel_id.to_string())
             .part("files", part);
@@ -791,9 +763,7 @@ impl Inbox {
 
     fn latest_cursor(&self) -> Result<i64> {
         self.connection
-            .query_row("SELECT MAX(id) FROM mattermost_events", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT MAX(id) FROM mattermost_events", [], |row| row.get(0))
             .optional()?
             .flatten()
             .map_or(Ok(0), Ok)
@@ -949,7 +919,9 @@ fn strip_mention(text: &str, username: &str) -> String {
     if username.is_empty() {
         return text.to_string();
     }
-    text.replace(&format!("@{username}"), "").trim().to_string()
+    text.replace(&format!("@{username}"), "")
+        .trim()
+        .to_string()
 }
 
 pub fn split_text(text: &str) -> Vec<String> {
@@ -971,11 +943,8 @@ pub fn split_text(text: &str) -> Vec<String> {
 pub fn parse_message_target(value: &str) -> Option<(&str, &str, &str)> {
     let (channel_type, rest) = value.split_once('|')?;
     let (channel, root) = rest.split_once('|')?;
-    (!channel_type.is_empty() && !channel.is_empty() && !root.is_empty()).then_some((
-        channel_type,
-        channel,
-        root,
-    ))
+    (!channel_type.is_empty() && !channel.is_empty() && !root.is_empty())
+        .then_some((channel_type, channel, root))
 }
 
 /// Splits a reply target (`<channel>|<root>` or `<channel>|<root>|<post-id>`),
@@ -1066,34 +1035,24 @@ mod tests {
         assert_eq!(event.root, "p1");
 
         // Bot posts, system posts, and empty text are unsupported or self.
-        assert!(
-            parse_event(&data(post("p4", "UBOT", "hi", "", ""), "D"), &identity())
-                .unwrap()
-                .is_from_me
-        );
-        assert!(
-            !parse_event(
-                &data(post("p5", "U1", "joined", "", "system_join_channel"), "O"),
-                &identity()
-            )
+        assert!(parse_event(&data(post("p4", "UBOT", "hi", "", ""), "D"), &identity())
             .unwrap()
-            .is_supported
-        );
-        assert!(
-            !parse_event(&data(post("p6", "U1", "  ", "", ""), "P"), &identity())
-                .unwrap()
-                .is_supported
-        );
+            .is_from_me);
+        assert!(!parse_event(
+            &data(post("p5", "U1", "joined", "", "system_join_channel"), "O"),
+            &identity()
+        )
+        .unwrap()
+        .is_supported);
+        assert!(!parse_event(&data(post("p6", "U1", "  ", "", ""), "P"), &identity())
+            .unwrap()
+            .is_supported);
     }
 
     #[test]
     fn detects_bot_mention_in_channel_post() {
         let mentioned = parse_event(
-            &data_mention(
-                post_in("C1", "p8", "U1", "@push hi", "", ""),
-                "O",
-                &["UBOT"],
-            ),
+            &data_mention(post_in("C1", "p8", "U1", "@push hi", "", ""), "O", &["UBOT"]),
             &identity(),
         )
         .unwrap();
@@ -1103,11 +1062,7 @@ mod tests {
         assert_eq!(mentioned.text, "hi");
 
         let others = parse_event(
-            &data_mention(
-                post_in("C1", "p9", "U1", "@someone hi", "", ""),
-                "O",
-                &["U2"],
-            ),
+            &data_mention(post_in("C1", "p9", "U1", "@someone hi", "", ""), "O", &["U2"]),
             &identity(),
         )
         .unwrap();
@@ -1154,9 +1109,7 @@ mod tests {
         }
         let count: i64 = inbox
             .connection
-            .query_row("SELECT COUNT(*) FROM mattermost_threads", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM mattermost_threads", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, MAX_ACTIVE_THREADS);
         // The oldest thread was evicted; the newest is retained.
@@ -1170,7 +1123,6 @@ mod tests {
     #[test]
     fn channel_and_dm_posts_key_and_target_distinctly() {
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             "http://unused".to_string(),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1188,11 +1140,7 @@ mod tests {
         );
 
         let ch = parse_event(
-            &data_mention(
-                post_in("C1", "p2", "U1", "@push hi", "", ""),
-                "O",
-                &["UBOT"],
-            ),
+            &data_mention(post_in("C1", "p2", "U1", "@push hi", "", ""), "O", &["UBOT"]),
             &identity(),
         )
         .unwrap();
@@ -1270,7 +1218,6 @@ mod tests {
 
         let path = temp_path("mattermost-typing-inbox");
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             "http://unused".to_string(),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1321,7 +1268,6 @@ mod tests {
         });
 
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             format!("http://{address}"),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1347,11 +1293,7 @@ mod tests {
         // Three requests: identity, remove :eyes:, add :white_check_mark:.
         let server = tokio::spawn(async move {
             let mut lines = Vec::new();
-            for body in [
-                r#"{"id":"UBOT"}"#,
-                r#"{"status":"OK"}"#,
-                r#"{"emoji_name":"ok"}"#,
-            ] {
+            for body in [r#"{"id":"UBOT"}"#, r#"{"status":"OK"}"#, r#"{"emoji_name":"ok"}"#] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut buffer = [0_u8; 1024];
                 let read = stream.read(&mut buffer).await.unwrap();
@@ -1367,7 +1309,6 @@ mod tests {
         });
 
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             format!("http://{address}"),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1382,8 +1323,9 @@ mod tests {
         let lines = server.await.unwrap();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("GET /api/v4/users/me"));
-        assert!(lines[1]
-            .starts_with("DELETE /api/v4/users/UBOT/posts/p9/reactions/hourglass_flowing_sand"));
+        assert!(lines[1].starts_with(
+            "DELETE /api/v4/users/UBOT/posts/p9/reactions/hourglass_flowing_sand"
+        ));
         assert!(lines[2].starts_with("POST /api/v4/reactions"));
     }
 
@@ -1430,16 +1372,13 @@ mod tests {
                 .unwrap_or_default()
                 .to_string();
             stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
                 .await
                 .unwrap();
             line
         });
 
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             format!("http://{address}"),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1481,7 +1420,6 @@ mod tests {
         });
 
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             format!("http://{address}"),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1505,7 +1443,6 @@ mod tests {
     #[tokio::test]
     async fn resolve_target_handles_channel_reply_and_user_forms() {
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             "http://unused".to_string(),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1532,7 +1469,6 @@ mod tests {
     async fn typing_without_open_socket_is_a_noop() {
         let path = temp_path("mattermost-typing-noop");
         let mm = Mattermost::with_inbox(
-            "mattermost".to_string(),
             "http://unused".to_string(),
             "token".to_string(),
             vec!["U1".to_string()],
@@ -1546,10 +1482,7 @@ mod tests {
 
     #[test]
     fn parses_message_and_reply_targets() {
-        assert_eq!(
-            parse_message_target("D|D1|root1"),
-            Some(("D", "D1", "root1"))
-        );
+        assert_eq!(parse_message_target("D|D1|root1"), Some(("D", "D1", "root1")));
         assert_eq!(parse_message_target("O|C1|p2"), Some(("O", "C1", "p2")));
         assert_eq!(parse_message_target("D1|root1"), None);
         assert_eq!(parse_message_target("D|D1|"), None);

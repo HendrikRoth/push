@@ -103,7 +103,7 @@ pub struct ShutdownSemantics {
 /// dropped.
 #[allow(async_fn_in_trait)]
 trait ChannelContract {
-    fn id(&self) -> &str;
+    fn id(&self) -> &'static str;
     fn primary_target(&self, configured: &str) -> Result<String>;
     async fn poll(&self, since: i64) -> Result<Vec<RawMessage>>;
     async fn latest_cursor(&self) -> Result<i64>;
@@ -183,8 +183,8 @@ pub enum Channel {
 }
 
 impl Channel {
-    pub fn new_for(cfg: &Config, channel: &crate::config::ChannelId) -> Result<Self> {
-        match channel.kind {
+    pub fn new_for(cfg: &Config, kind: ChannelKind) -> Result<Self> {
+        match kind {
             ChannelKind::IMessage => Ok(Self::IMessage(IMessageChannel {
                 poller: IMessagePoller::new(cfg.db_path.clone()),
                 sender: IMessageSender::new(),
@@ -214,22 +214,14 @@ impl Channel {
                 cfg.slack_allow_user_ids.clone(),
                 &cfg.state_path,
             )?)),
-            ChannelKind::Mattermost => {
-                let instance = cfg
-                    .mattermost_instances()?
-                    .into_iter()
-                    .find(|instance| instance.id == channel.id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Mattermost instance {:?} is not configured", channel.id)
-                    })?;
-                Ok(Self::Mattermost(Mattermost::new(
-                    instance.id,
-                    instance.url,
-                    instance.token,
-                    instance.allow_user_ids,
-                    &cfg.state_path,
-                )?))
-            }
+            ChannelKind::Mattermost => Ok(Self::Mattermost(Mattermost::new(
+                cfg.mattermost_url()
+                    .ok_or_else(|| anyhow::anyhow!("Mattermost server URL is not configured"))?,
+                cfg.mattermost_token()
+                    .ok_or_else(|| anyhow::anyhow!("Mattermost token is not configured"))?,
+                cfg.mattermost_allow_user_ids.clone(),
+                &cfg.state_path,
+            )?)),
         }
     }
 
@@ -242,7 +234,7 @@ impl Channel {
         }
     }
 
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &'static str {
         match self {
             Self::IMessage(channel) => ChannelContract::id(channel),
             Self::Telegram(channel) => ChannelContract::id(channel),
@@ -293,7 +285,9 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::approval_origin(channel, message, thread),
             Self::Telegram(channel) => ChannelContract::approval_origin(channel, message, thread),
             Self::Slack(channel) => ChannelContract::approval_origin(channel, message, thread),
-            Self::Mattermost(channel) => ChannelContract::approval_origin(channel, message, thread),
+            Self::Mattermost(channel) => {
+                ChannelContract::approval_origin(channel, message, thread)
+            }
         }
     }
 
@@ -338,7 +332,9 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
             Self::Telegram(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
             Self::Slack(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
-            Self::Mattermost(channel) => ChannelContract::send_chunk(channel, target, chunk).await,
+            Self::Mattermost(channel) => {
+                ChannelContract::send_chunk(channel, target, chunk).await
+            }
         }
     }
 
@@ -392,7 +388,9 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_voice(channel, target, clip).await,
             Self::Telegram(channel) => ChannelContract::send_voice(channel, target, clip).await,
             Self::Slack(channel) => ChannelContract::send_voice(channel, target, clip).await,
-            Self::Mattermost(channel) => ChannelContract::send_voice(channel, target, clip).await,
+            Self::Mattermost(channel) => {
+                ChannelContract::send_voice(channel, target, clip).await
+            }
         }
     }
 
@@ -410,7 +408,9 @@ impl Channel {
             Self::IMessage(channel) => ChannelContract::send_files(channel, target, files).await,
             Self::Telegram(channel) => ChannelContract::send_files(channel, target, files).await,
             Self::Slack(channel) => ChannelContract::send_files(channel, target, files).await,
-            Self::Mattermost(channel) => ChannelContract::send_files(channel, target, files).await,
+            Self::Mattermost(channel) => {
+                ChannelContract::send_files(channel, target, files).await
+            }
         }
     }
 
@@ -462,7 +462,7 @@ impl ChannelContract for IMessageChannel {
             .map(|message| RawMessage {
                 row_id: message.row_id,
                 provider_event_id: None,
-                channel: "imessage",
+                channel: self.id(),
                 handle: message.handle,
                 chat_identifier: message.chat_identifier,
                 is_group: message.is_group,
@@ -796,8 +796,8 @@ impl ChannelContract for Slack {
 }
 
 impl ChannelContract for Mattermost {
-    fn id(&self) -> &str {
-        self.channel_id()
+    fn id(&self) -> &'static str {
+        "mattermost"
     }
 
     fn primary_target(&self, configured: &str) -> Result<String> {
@@ -840,13 +840,12 @@ impl ChannelContract for Mattermost {
         // A direct message is one conversation per channel. Every other channel
         // type keeps each thread as its own session and carries the triggering
         // post id so the working signal can react to that exact message.
-        let id = self.channel_id();
         if channel_type == "D" {
-            return Some((format!("{id}:dm:{channel}"), format!("{channel}|{root}")));
+            return Some((format!("mattermost:dm:{channel}"), format!("{channel}|{root}")));
         }
         let post_id = message.provider_event_id.as_deref().unwrap_or(root);
         Some((
-            format!("{id}:ch:{channel}:{root}"),
+            format!("mattermost:ch:{channel}:{root}"),
             format!("{channel}|{root}|{post_id}"),
         ))
     }

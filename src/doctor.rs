@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::{channel::Channel, config, history, jobs};
 use config::{
@@ -131,15 +131,11 @@ fn check_scheduled_delivery(cfg: &config::Config, checks: &mut Vec<Check>) {
         return;
     };
     let result = (|| {
-        // The channel may name a specific Mattermost instance ("mattermost:work").
-        let kind_name = primary.channel.split(':').next().unwrap_or_default();
-        config::ChannelKind::parse(kind_name)?;
-        let channel_id = cfg
-            .enabled_channels()?
-            .into_iter()
-            .find(|channel| channel.id == primary.channel)
-            .with_context(|| format!("primary channel {:?} is not enabled", primary.channel))?;
-        let channel = Channel::new_for(cfg, &channel_id)?;
+        let kind = config::ChannelKind::parse(&primary.channel)?;
+        if !cfg.enabled_channel_kinds()?.contains(&kind) {
+            anyhow::bail!("primary channel {:?} is not enabled", primary.channel);
+        }
+        let channel = Channel::new_for(cfg, kind)?;
         channel.primary_target(&primary.target)?;
         Ok::<_, anyhow::Error>(())
     })();
@@ -354,29 +350,23 @@ fn check_slack_config(cfg: &config::Config, checks: &mut Vec<Check>) {
 }
 
 fn check_mattermost_config(cfg: &config::Config, checks: &mut Vec<Check>) {
-    let instances = match cfg.mattermost_instances() {
-        Ok(instances) if !instances.is_empty() => instances,
-        Ok(_) => {
-            checks.push(Check::fail(
-                "Mattermost config",
-                format!("not configured. Set mattermost.url and {MATTERMOST_TOKEN_ENV} (or mattermost.token), or add a [[mattermost]] block."),
-            ));
-            return;
-        }
-        Err(error) => {
-            checks.push(Check::fail("Mattermost config", error.to_string()));
-            return;
-        }
-    };
-    for instance in instances {
-        // mattermost_instances() already guarantees a non-empty token and url.
+    if cfg.mattermost_token().is_some() {
         checks.push(Check::pass(
-            format!("{} token", instance.id),
-            "token is configured".to_string(),
+            "Mattermost token",
+            format!("loaded from config or {MATTERMOST_TOKEN_ENV}"),
         ));
-        checks.push(Check::pass(
-            format!("{} server URL", instance.id),
-            format!("{} is set", instance.url),
+    } else {
+        checks.push(Check::fail(
+            "Mattermost token",
+            format!("not configured. Set {MATTERMOST_TOKEN_ENV} or mattermost.token without printing the token."),
+        ));
+    }
+    if cfg.mattermost_url().is_some() {
+        checks.push(Check::pass("Mattermost server URL", "mattermost.url is set"));
+    } else {
+        checks.push(Check::fail(
+            "Mattermost server URL",
+            "not configured. Set mattermost.url to your Mattermost server URL.",
         ));
     }
 }
