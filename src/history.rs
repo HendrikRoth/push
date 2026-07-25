@@ -12,7 +12,7 @@ use crate::approval::{parse_answer, AnswerOrigin, AnswerOutcome, NormalizedAnswe
 #[cfg(test)]
 use crate::approval::{DeliveryStatus as ApprovalDeliveryStatus, Question};
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
 const READ_TRUNCATED: &str = "\n[truncated by push while reading history]";
@@ -106,6 +106,14 @@ pub struct PendingReminder {
     pub message: String,
 }
 
+/// A job's summed consumption over a time window, for budget evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobUsageTotal {
+    pub job_name: String,
+    pub tokens: i64,
+    pub cost_usd: f64,
+}
+
 pub struct History {
     path: PathBuf,
     conn: Connection,
@@ -192,6 +200,46 @@ impl History {
         tx.commit()
             .with_context(|| format!("commit outbound message to {database_path}"))?;
         Ok(message)
+    }
+
+    /// Per-job token and cost totals for runs recorded at or after `since_ms`,
+    /// used to evaluate daily budget limits.
+    pub fn job_usage_since(&self, since_ms: i64) -> Result<Vec<JobUsageTotal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_name, COALESCE(SUM(input_tokens + output_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0)
+             FROM job_usage
+             WHERE created_at_ms >= ?1
+             GROUP BY job_name",
+        )?;
+        let rows = stmt
+            .query_map([since_ms], |row| {
+                Ok(JobUsageTotal {
+                    job_name: row.get(0)?,
+                    tokens: row.get(1)?,
+                    cost_usd: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Records that `job_name` alerted for `metric` on `day`. Returns true only
+    /// on the first call for that key, so the caller sends the alert exactly
+    /// once. Concurrent callers race on the primary key; the loser gets false.
+    pub fn claim_budget_alert(
+        &mut self,
+        job_name: &str,
+        day: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO budget_alerts (job_name, day, metric, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![job_name, day, metric, now_ms],
+        )?;
+        Ok(inserted == 1)
     }
 
     pub fn record_stop_target(
@@ -997,6 +1045,20 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 14;",
         )?;
     }
+    if version <= 14 {
+        // One row per (job, local day, metric) that has already alerted, so a
+        // budget alert fires at most once per day per metric.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS budget_alerts (
+                 job_name TEXT NOT NULL,
+                 day TEXT NOT NULL,
+                 metric TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (job_name, day, metric)
+             );
+             PRAGMA user_version = 15;",
+        )?;
+    }
     conn.execute_batch("COMMIT;")?;
     Ok(())
 }
@@ -1044,6 +1106,51 @@ mod tests {
     use super::*;
     use crate::approval::{Choice, Question};
     use crate::test_support::temp_path;
+
+    #[test]
+    fn job_usage_since_sums_tokens_and_cost_within_window() {
+        let path = temp_path("job-usage-window");
+        let history = History::open(path.to_str().unwrap()).unwrap();
+        history.execute_batch_for_test(
+            "INSERT INTO job_usage
+                (job_name, backend, input_tokens, output_tokens, cost_usd, duration_ms, created_at_ms)
+             VALUES
+                ('triage', 'claude', 100, 50, 0.10, 0, 1000),
+                ('triage', 'claude', 200, 100, 0.20, 0, 2000),
+                ('triage', 'claude', 999, 999, 9.99, 0, 500),
+                ('cve',    'codex',  10,  5,  0.00, 0, 2000);",
+        );
+
+        // Window excludes the created_at_ms = 500 row.
+        let totals = history.job_usage_since(1000).unwrap();
+        let triage = totals.iter().find(|t| t.job_name == "triage").unwrap();
+        assert_eq!(triage.tokens, 450);
+        assert!((triage.cost_usd - 0.30).abs() < 1e-9);
+        let cve = totals.iter().find(|t| t.job_name == "cve").unwrap();
+        assert_eq!(cve.tokens, 15);
+    }
+
+    #[test]
+    fn claim_budget_alert_is_true_only_once_per_key() {
+        let path = temp_path("budget-claim");
+        let mut history = History::open(path.to_str().unwrap()).unwrap();
+
+        assert!(history
+            .claim_budget_alert("triage", "2026-07-25", "tokens", 1)
+            .unwrap());
+        // Same key again: already claimed.
+        assert!(!history
+            .claim_budget_alert("triage", "2026-07-25", "tokens", 2)
+            .unwrap());
+        // Different metric same day: independent claim.
+        assert!(history
+            .claim_budget_alert("triage", "2026-07-25", "cost", 3)
+            .unwrap());
+        // Next day: fresh claim.
+        assert!(history
+            .claim_budget_alert("triage", "2026-07-26", "tokens", 4)
+            .unwrap());
+    }
 
     #[test]
     fn reminders_fire_once_after_their_time() {
