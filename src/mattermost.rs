@@ -274,10 +274,15 @@ impl Mattermost {
 
     async fn react_working(&self, post_id: &str) {
         if self.state.reacted.lock().unwrap().contains(post_id) {
+            warn!("mattermost working reaction on post {post_id} skipped: already reacted");
             return;
         }
-        let Ok(identity) = self.state.ensure_identity().await else {
-            return;
+        let identity = match self.state.ensure_identity().await {
+            Ok(identity) => identity,
+            Err(error) => {
+                warn!("mattermost working reaction on post {post_id} skipped: identity unavailable: {error:#}");
+                return;
+            }
         };
         match self
             .state
@@ -292,6 +297,7 @@ impl Mattermost {
             .await
         {
             Ok(_) => {
+                warn!("mattermost working reaction on post {post_id} added");
                 self.state.reacted.lock().unwrap().insert(post_id.to_string());
             }
             Err(error) => {
