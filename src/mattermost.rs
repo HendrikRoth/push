@@ -274,7 +274,6 @@ impl Mattermost {
 
     async fn react_working(&self, post_id: &str) {
         if self.state.reacted.lock().unwrap().contains(post_id) {
-            warn!("mattermost working reaction on post {post_id} skipped: already reacted");
             return;
         }
         let identity = match self.state.ensure_identity().await {
@@ -296,8 +295,11 @@ impl Mattermost {
             )
             .await
         {
-            Ok(_) => {
-                warn!("mattermost working reaction on post {post_id} added");
+            Ok(value) => {
+                warn!(
+                    "mattermost working reaction on post {post_id} added as {} (bot user {}): {value}",
+                    WORKING_EMOJI, identity.user_id
+                );
                 self.state.reacted.lock().unwrap().insert(post_id.to_string());
             }
             Err(error) => {
