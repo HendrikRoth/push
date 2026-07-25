@@ -45,6 +45,40 @@ struct Frontmatter {
     evals: Vec<String>,
     #[serde(default)]
     triggers: Vec<Trigger>,
+    #[serde(default)]
+    notify: Option<String>,
+}
+
+/// When a scheduled run's result is delivered to `primary_delivery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyPolicy {
+    /// Deliver every terminal outcome (the default).
+    Always,
+    /// Deliver only failures and timeouts; stay silent on success.
+    OnFailure,
+    /// Deliver only successful runs.
+    OnSuccess,
+}
+
+impl NotifyPolicy {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "always" => Ok(Self::Always),
+            "on_failure" => Ok(Self::OnFailure),
+            "on_success" => Ok(Self::OnSuccess),
+            other => bail!(
+                "invalid notify {other:?}; expected \"always\", \"on_failure\", or \"on_success\""
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnFailure => "on_failure",
+            Self::OnSuccess => "on_success",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +108,7 @@ pub struct Job {
     pub snapshot_hash: String,
     pub evals: Vec<Eval>,
     pub triggers: Vec<Trigger>,
+    pub notify: NotifyPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +252,12 @@ pub(crate) fn validate_contents(
         .map(AgentBackend::parse)
         .transpose()?
         .unwrap_or(cfg.jobs_backend()?);
+    let notify = metadata
+        .notify
+        .as_deref()
+        .map(NotifyPolicy::parse)
+        .transpose()?
+        .unwrap_or(NotifyPolicy::Always);
     let workdir = match metadata.workdir.as_deref() {
         Some(workdir) => canonical_workdir(workdir)?,
         None => canonical_workdir(&cfg.assistant_root)
@@ -242,6 +283,7 @@ pub(crate) fn validate_contents(
         snapshot_hash,
         evals,
         triggers: metadata.triggers,
+        notify,
     })
 }
 
@@ -923,12 +965,12 @@ impl Ledger {
                 id, job_name, snapshot_hash, trigger_kind, trigger_id, owner_kind,
                 scheduled_at_ms, queued_at_ms, finished_at_ms, backend,
                 permission_profile, timeout_ms, workdir, state, error,
-                delivery_state, delivery_channel, delivery_target
+                delivery_state, delivery_channel, delivery_target, notify
              ) VALUES (?1, ?2, ?3, 'cron', ?4, 'gateway_scheduler', ?5, ?6,
                 CASE WHEN ?7 = 'skipped_overlap' THEN ?6 ELSE NULL END,
                 ?8, ?9, ?10, ?11, ?7, ?12,
                 CASE WHEN ?7 = 'skipped_overlap' THEN 'pending' ELSE 'not_requested' END,
-                ?13, ?14)
+                ?13, ?14, ?15)
              ON CONFLICT DO NOTHING",
             params![
                 id,
@@ -945,6 +987,7 @@ impl Ledger {
                 error,
                 delivery_channel,
                 delivery_target,
+                job.notify.as_str(),
             ],
         )?;
         let existing = tx.query_row(
@@ -1057,7 +1100,12 @@ impl Ledger {
         let changed = self.conn.execute(
             "UPDATE job_runs SET state = ?2, finished_at_ms = ?3, result = ?4,
                 error = ?5, evaluation_state = ?6, evaluation_result = ?7,
-                evaluation_error = ?8, delivery_state = 'pending'
+                evaluation_error = ?8,
+                delivery_state = CASE
+                    WHEN notify = 'on_failure' AND ?2 IN ('failed', 'timed_out') THEN 'pending'
+                    WHEN notify = 'on_success' AND ?2 = 'succeeded' THEN 'pending'
+                    WHEN notify = 'on_failure' OR notify = 'on_success' THEN 'not_requested'
+                    ELSE 'pending' END
              WHERE id = ?1 AND state = 'running'",
             params![
                 id,
@@ -1099,8 +1147,16 @@ impl Ledger {
                         THEN 'error' ELSE evaluation_state END,
                     evaluation_error = CASE WHEN result IS NOT NULL AND evaluation_state = 'running'
                         THEN 'evaluator exited before completion' ELSE evaluation_error END,
-                    delivery_state = CASE WHEN owner_kind = 'gateway_scheduler'
-                        THEN 'pending' ELSE delivery_state END
+                    delivery_state = CASE
+                        WHEN owner_kind = 'gateway_scheduler' AND (
+                            notify = 'always'
+                            OR (notify = 'on_failure'
+                                AND NOT (result IS NOT NULL AND evaluation_state = 'running'))
+                            OR (notify = 'on_success'
+                                AND (result IS NOT NULL AND evaluation_state = 'running'))
+                        ) THEN 'pending'
+                        WHEN owner_kind = 'gateway_scheduler' THEN 'not_requested'
+                        ELSE delivery_state END
                  WHERE job_name = ?1 AND state = 'running'",
                 params![name, now],
             )?;
@@ -1747,8 +1803,14 @@ fn format_delivery(row: &DeliveryRun) -> String {
         }
         _ => String::new(),
     };
+    // Make failures stand out in the delivery stream.
+    let marker = if matches!(row.state.as_str(), "failed" | "timed_out") {
+        "⚠️ "
+    } else {
+        ""
+    };
     format!(
-        "Job `{}` {}.\n\n{}{}",
+        "{marker}Job `{}` {}.\n\n{}{}",
         row.job_name, row.state, detail, evaluation
     )
 }
@@ -2648,6 +2710,101 @@ mod tests {
             )
             .unwrap();
         assert_eq!(final_state, ("delivered".to_string(), 3));
+    }
+
+    #[test]
+    fn notify_policy_parses_and_rejects_unknown_values() {
+        assert_eq!(NotifyPolicy::parse("always").unwrap(), NotifyPolicy::Always);
+        assert_eq!(
+            NotifyPolicy::parse("on_failure").unwrap(),
+            NotifyPolicy::OnFailure
+        );
+        assert_eq!(
+            NotifyPolicy::parse("on_success").unwrap(),
+            NotifyPolicy::OnSuccess
+        );
+        assert!(NotifyPolicy::parse("sometimes").is_err());
+    }
+
+    #[test]
+    fn notify_defaults_to_always_and_parses_from_frontmatter() {
+        let jobs_dir = temp_dir("notify-parse-jobs");
+        let workdir = temp_dir("notify-parse-work");
+        let database = temp_path("notify-parse-db");
+        let run_dir = temp_dir("notify-parse-run");
+        let cfg = cfg(&jobs_dir, &database, &run_dir);
+
+        write_job(&jobs_dir, "default", &scheduled_job(&workdir, false));
+        assert_eq!(
+            Catalog::load_named(&cfg, "default").unwrap().notify,
+            NotifyPolicy::Always
+        );
+
+        let with_notify = scheduled_job(&workdir, false)
+            .replace("backend = \"codex\"", "backend = \"codex\"\nnotify = \"on_failure\"");
+        write_job(&jobs_dir, "quiet", &with_notify);
+        assert_eq!(
+            Catalog::load_named(&cfg, "quiet").unwrap().notify,
+            NotifyPolicy::OnFailure
+        );
+    }
+
+    #[test]
+    fn notify_policy_gates_scheduled_delivery_state() {
+        let jobs_dir = temp_dir("notify-gate-jobs");
+        let workdir = temp_dir("notify-gate-work");
+        let database = temp_path("notify-gate-db");
+        let run_dir = temp_dir("notify-gate-run");
+        let cfg = cfg(&jobs_dir, &database, &run_dir);
+
+        let cases = [
+            ("on_failure", "succeeded", "not_requested"),
+            ("on_failure", "failed", "pending"),
+            ("on_failure", "timed_out", "pending"),
+            ("on_success", "succeeded", "pending"),
+            ("on_success", "failed", "not_requested"),
+            ("always", "succeeded", "pending"),
+            ("always", "failed", "pending"),
+        ];
+        for (index, (policy, state, expected)) in cases.into_iter().enumerate() {
+            let name = format!("gate{index}");
+            let body = scheduled_job(&workdir, false).replace(
+                "backend = \"codex\"",
+                &format!("backend = \"codex\"\nnotify = {policy:?}"),
+            );
+            write_job(&jobs_dir, &name, &body);
+            let job = Catalog::load_named(&cfg, &name).unwrap();
+            let mut ledger = Ledger::open(&cfg.database_path).unwrap();
+            let id = ledger
+                .enqueue_scheduled(&job, &job.triggers[0], 60_000, 60_000, "telegram", "7")
+                .unwrap();
+            ledger
+                .conn
+                .execute("UPDATE job_runs SET state = 'running' WHERE id = ?1", [&id])
+                .unwrap();
+            ledger
+                .finish_scheduled(
+                    &id,
+                    state,
+                    (state == "succeeded").then_some("done"),
+                    (state != "succeeded").then_some("boom"),
+                    &EvaluationOutcome::not_requested(),
+                    120_000,
+                )
+                .unwrap();
+            let delivery_state: String = ledger
+                .conn
+                .query_row(
+                    "SELECT delivery_state FROM job_runs WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                delivery_state, expected,
+                "notify={policy} state={state} should gate to {expected}"
+            );
+        }
     }
 
     #[tokio::test]

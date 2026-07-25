@@ -12,7 +12,7 @@ use crate::approval::{parse_answer, AnswerOrigin, AnswerOutcome, NormalizedAnswe
 #[cfg(test)]
 use crate::approval::{DeliveryStatus as ApprovalDeliveryStatus, Question};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
 const READ_TRUNCATED: &str = "\n[truncated by push while reading history]";
@@ -824,6 +824,19 @@ fn migrate(conn: &Connection) -> Result<()> {
             [RETIRED_JOB_APPROVAL_ERROR],
         )?;
         conn.execute_batch("PRAGMA user_version = 10;")?;
+    }
+    if version <= 10 {
+        let has_notify = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('job_runs') WHERE name = 'notify'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        if !has_notify {
+            conn.execute_batch(
+                "ALTER TABLE job_runs ADD COLUMN notify TEXT NOT NULL DEFAULT 'always';",
+            )?;
+        }
+        conn.execute_batch("PRAGMA user_version = 11;")?;
     }
     conn.execute_batch("COMMIT;")?;
     Ok(())

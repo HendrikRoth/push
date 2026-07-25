@@ -44,6 +44,13 @@ Frontmatter fields:
 | `backend` | no | `claude`, `codex`, or `pi`; defaults to `jobs_agent`, then root `agent` |
 | `evals` | no | Reusable Markdown agent eval names from `<assistant_root>/evals/` |
 | `triggers` | no | One or more cron trigger tables |
+| `notify` | no | When to deliver: `always` (default), `on_failure`, or `on_success` |
+
+`notify` controls whether a scheduled run's result is delivered to
+`primary_delivery`. Use `on_failure` for a monitoring job that should stay
+silent while healthy and only message you when it fails or times out. Failure
+and timeout deliveries are prefixed with a ⚠️ marker so they stand out. `notify`
+does not affect a manual `push job run`, which always returns its output.
 
 Unknown fields are errors. The assistant repository is a valid work directory.
 A job work directory may not overlap Push state, database, audit log, job lock
