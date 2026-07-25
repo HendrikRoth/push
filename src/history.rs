@@ -12,7 +12,7 @@ use crate::approval::{parse_answer, AnswerOrigin, AnswerOutcome, NormalizedAnswe
 #[cfg(test)]
 use crate::approval::{DeliveryStatus as ApprovalDeliveryStatus, Question};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
 const READ_TRUNCATED: &str = "\n[truncated by push while reading history]";
@@ -92,6 +92,17 @@ pub struct Reminder {
     pub id: i64,
     pub channel: String,
     pub target: String,
+    pub message: String,
+    pub fire_at_ms: i64,
+    /// Empty for a one-off reminder, else `"daily"` or `"weekdays"`.
+    pub recurrence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReminder {
+    pub id: i64,
+    pub fire_at_ms: i64,
+    pub recurrence: String,
     pub message: String,
 }
 
@@ -214,6 +225,7 @@ impl History {
         Ok(target_row_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_reminder(
         &mut self,
         channel: &str,
@@ -221,13 +233,15 @@ impl History {
         thread: &str,
         message: &str,
         fire_at_ms: i64,
+        recurrence: &str,
         now_ms: i64,
     ) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO reminders (channel, target, thread, message, fire_at_ms, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![channel, target, thread, message, fire_at_ms, now_ms],
+                "INSERT INTO reminders
+                    (channel, target, thread, message, fire_at_ms, recurrence, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![channel, target, thread, message, fire_at_ms, recurrence, now_ms],
             )
             .context("insert reminder")?;
         Ok(self.conn.last_insert_rowid())
@@ -235,7 +249,7 @@ impl History {
 
     pub fn due_reminders(&self, now_ms: i64) -> Result<Vec<Reminder>> {
         let mut statement = self.conn.prepare(
-            "SELECT id, channel, target, message FROM reminders
+            "SELECT id, channel, target, message, fire_at_ms, recurrence FROM reminders
              WHERE delivered = 0 AND fire_at_ms <= ?1
              ORDER BY fire_at_ms, id",
         )?;
@@ -246,6 +260,8 @@ impl History {
                     channel: row.get(1)?,
                     target: row.get(2)?,
                     message: row.get(3)?,
+                    fire_at_ms: row.get(4)?,
+                    recurrence: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -253,10 +269,54 @@ impl History {
         Ok(rows)
     }
 
+    /// Pending (undelivered) reminders for one conversation thread.
+    pub fn pending_reminders(&self, thread: &str) -> Result<Vec<PendingReminder>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, fire_at_ms, recurrence, message FROM reminders
+             WHERE delivered = 0 AND thread = ?1
+             ORDER BY fire_at_ms, id",
+        )?;
+        let rows = statement
+            .query_map([thread], |row| {
+                Ok(PendingReminder {
+                    id: row.get(0)?,
+                    fire_at_ms: row.get(1)?,
+                    recurrence: row.get(2)?,
+                    message: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read pending reminders")?;
+        Ok(rows)
+    }
+
+    /// Cancels a pending reminder owned by `thread`. Returns whether one matched.
+    pub fn cancel_reminder(&mut self, id: i64, thread: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM reminders WHERE id = ?1 AND thread = ?2 AND delivered = 0",
+                params![id, thread],
+            )
+            .context("cancel reminder")?;
+        Ok(changed > 0)
+    }
+
     pub fn mark_reminder_delivered(&mut self, id: i64) -> Result<()> {
         self.conn
             .execute("UPDATE reminders SET delivered = 1 WHERE id = ?1", [id])
             .context("mark reminder delivered")?;
+        Ok(())
+    }
+
+    /// Re-arms a recurring reminder for its next occurrence.
+    pub fn reschedule_reminder(&mut self, id: i64, next_fire_ms: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reminders SET fire_at_ms = ?2 WHERE id = ?1",
+                params![id, next_fire_ms],
+            )
+            .context("reschedule reminder")?;
         Ok(())
     }
 
@@ -908,6 +968,19 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 12;",
         )?;
     }
+    if version <= 12 {
+        let has_recurrence = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('reminders') WHERE name = 'recurrence'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        if !has_recurrence {
+            conn.execute_batch(
+                "ALTER TABLE reminders ADD COLUMN recurrence TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+        conn.execute_batch("PRAGMA user_version = 13;")?;
+    }
     conn.execute_batch("COMMIT;")?;
     Ok(())
 }
@@ -961,7 +1034,15 @@ mod tests {
         let path = temp_path("reminders");
         let mut history = History::open(path.to_str().unwrap()).unwrap();
         let id = history
-            .insert_reminder("mattermost", "C1|root", "mattermost:ch:C1:root", "call mum", 5_000, 0)
+            .insert_reminder(
+                "mattermost",
+                "C1|root",
+                "mattermost:ch:C1:root",
+                "call mum",
+                5_000,
+                "",
+                0,
+            )
             .unwrap();
 
         // Not due yet.
@@ -978,6 +1059,43 @@ mod tests {
         // Delivered reminders do not fire again.
         history.mark_reminder_delivered(id).unwrap();
         assert!(history.due_reminders(10_000).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reminders_list_cancel_and_reschedule() {
+        let path = temp_path("reminders-manage");
+        let mut history = History::open(path.to_str().unwrap()).unwrap();
+        let thread = "mattermost:ch:C1:root";
+        let one_off = history
+            .insert_reminder("mattermost", "C1|root", thread, "one off", 5_000, "", 0)
+            .unwrap();
+        let recurring = history
+            .insert_reminder("mattermost", "C1|root", thread, "daily standup", 9_000, "daily", 0)
+            .unwrap();
+        // A reminder in another thread is not listed here.
+        history
+            .insert_reminder("mattermost", "C2|r", "mattermost:ch:C2:r", "other", 1_000, "", 0)
+            .unwrap();
+
+        let pending = history.pending_reminders(thread).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, one_off);
+        assert_eq!(pending[1].recurrence, "daily");
+
+        // Recurring reminders carry their recurrence and fire time when due.
+        let due = history.due_reminders(9_000).unwrap();
+        let daily = due.iter().find(|r| r.id == recurring).unwrap();
+        assert_eq!(daily.recurrence, "daily");
+        assert_eq!(daily.fire_at_ms, 9_000);
+        history.reschedule_reminder(recurring, 95_000).unwrap();
+        assert!(history.due_reminders(9_000).unwrap().iter().all(|r| r.id != recurring));
+
+        // Cancel is scoped to the owning thread.
+        assert!(!history.cancel_reminder(one_off, "someone:else").unwrap());
+        assert!(history.cancel_reminder(one_off, thread).unwrap());
+        assert!(!history.cancel_reminder(one_off, thread).unwrap());
+        assert_eq!(history.pending_reminders(thread).unwrap().len(), 1);
         let _ = std::fs::remove_file(path);
     }
 

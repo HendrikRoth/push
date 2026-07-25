@@ -307,13 +307,17 @@ async fn deliver_due_reminders(contexts: &HashMap<String, Ctx>) {
         };
         let text = format!("⏰ Reminder: {}", reminder.message);
         if reply_to(ctx, &reminder.target, &text).await {
-            if let Err(error) = ctx
-                .history
-                .lock()
-                .unwrap()
-                .mark_reminder_delivered(reminder.id)
-            {
-                warn!("mark reminder {} delivered: {error:#}", reminder.id);
+            let next = (!reminder.recurrence.is_empty())
+                .then(|| worker::next_recurrence(reminder.fire_at_ms, &reminder.recurrence))
+                .flatten();
+            let mut history = ctx.history.lock().unwrap();
+            let result = match next {
+                // A recurring reminder is re-armed for its next occurrence.
+                Some(next_fire) => history.reschedule_reminder(reminder.id, next_fire),
+                None => history.mark_reminder_delivered(reminder.id),
+            };
+            if let Err(error) = result {
+                warn!("settle reminder {}: {error:#}", reminder.id);
             }
         }
     }
