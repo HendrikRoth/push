@@ -17,11 +17,21 @@ pub struct Request<'a> {
     pub prompt: &'a str,
 }
 
+/// Token and cost consumption reported by a backend for one turn. Fields are
+/// best-effort: a backend that does not report a value leaves it at zero.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
 /// A completed agent turn.
 #[derive(Debug)]
 pub struct RunOutput {
     pub reply: String,
     pub session_id: Option<String>,
+    pub usage: Usage,
 }
 
 /// What went wrong, separated so the gateway can phrase timeouts differently.
@@ -214,6 +224,7 @@ impl FakeRunner {
         Ok(RunOutput {
             reply: format!("fake reply: {}", req.prompt),
             session_id: req.is_new.then(|| self.session_id.clone()),
+            usage: Usage::default(),
         })
     }
 }

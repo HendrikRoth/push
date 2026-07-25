@@ -12,7 +12,7 @@ use crate::approval::{parse_answer, AnswerOrigin, AnswerOutcome, NormalizedAnswe
 #[cfg(test)]
 use crate::approval::{DeliveryStatus as ApprovalDeliveryStatus, Question};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const RETIRED_JOB_APPROVAL_ERROR: &str = "job approval was removed; request direct job creation";
 const MAX_HISTORY_READ_BYTES: usize = 8 * 1024;
 const READ_TRUNCATED: &str = "\n[truncated by push while reading history]";
@@ -980,6 +980,22 @@ fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
         conn.execute_batch("PRAGMA user_version = 13;")?;
+    }
+    if version <= 13 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS job_usage (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 job_name TEXT NOT NULL,
+                 backend TEXT NOT NULL,
+                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 cost_usd REAL NOT NULL DEFAULT 0,
+                 duration_ms INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS job_usage_name_idx ON job_usage(job_name);
+             PRAGMA user_version = 14;",
+        )?;
     }
     conn.execute_batch("COMMIT;")?;
     Ok(())

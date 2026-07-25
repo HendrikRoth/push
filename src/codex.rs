@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::agent::{final_reply, Request, RunError, RunOutput};
+use crate::agent::{final_reply, Request, RunError, RunOutput, Usage};
 
 /// Runner invokes `codex exec` in non-interactive mode.
 pub struct Runner {
@@ -32,6 +32,8 @@ struct JsonEvent {
     thread_id: Option<String>,
     #[serde(default)]
     item: Value,
+    #[serde(default)]
+    usage: Value,
 }
 
 struct OutputFile {
@@ -100,6 +102,7 @@ impl Runner {
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         let session_id = session_id_from_jsonl(&stdout);
+        let usage = usage_from_jsonl(&stdout);
         let reply = std::fs::read_to_string(out_path)
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -125,6 +128,7 @@ impl Runner {
         Ok(RunOutput {
             reply: final_reply("codex", &reply)?,
             session_id,
+            usage,
         })
     }
 
@@ -227,6 +231,25 @@ fn session_id_from_jsonl(s: &str) -> Option<String> {
     })
 }
 
+/// Sums usage across every `turn.completed` event. Codex reports cached input
+/// tokens separately, so they are folded into the input side. Codex does not
+/// report a dollar cost, so cost stays zero.
+fn usage_from_jsonl(s: &str) -> Usage {
+    let mut usage = Usage::default();
+    for line in s.lines() {
+        let Ok(ev) = serde_json::from_str::<JsonEvent>(line) else {
+            continue;
+        };
+        if ev.kind != "turn.completed" {
+            continue;
+        }
+        let field = |name: &str| ev.usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+        usage.input_tokens += field("input_tokens") + field("cached_input_tokens");
+        usage.output_tokens += field("output_tokens");
+    }
+    usage
+}
+
 fn last_agent_message_from_jsonl(s: &str) -> Option<String> {
     s.lines().filter_map(agent_message_from_line).next_back()
 }
@@ -274,6 +297,28 @@ mod tests {
     fn ignores_empty_thread_id() {
         let s = r#"{"type":"thread.started","thread_id":" \t\n "}"#;
         assert_eq!(session_id_from_jsonl(s), None);
+    }
+
+    #[test]
+    fn sums_usage_across_turns_folding_cached_input() {
+        let s = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":40}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":3}}"#,
+        );
+        let usage = usage_from_jsonl(s);
+        assert_eq!(usage.input_tokens, 125);
+        assert_eq!(usage.output_tokens, 43);
+        assert_eq!(usage.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn usage_is_zero_without_turn_events() {
+        let usage = usage_from_jsonl(r#"{"type":"thread.started","thread_id":"abc"}"#);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
     }
 
     #[test]
