@@ -12,6 +12,7 @@ use crate::util::expand_home;
 pub const TELEGRAM_BOT_TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
 pub const SLACK_APP_TOKEN_ENV: &str = "SLACK_APP_TOKEN";
 pub const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
+pub const MATTERMOST_TOKEN_ENV: &str = "MATTERMOST_TOKEN";
 pub const DEFAULT_VOICE_NAME: &str = "cedar";
 const SUPPORTED_VOICE_NAMES: &[&str] = &[
     "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse",
@@ -67,6 +68,12 @@ pub struct Config {
     pub slack_bot_token: Option<String>,
     #[serde(default)]
     pub slack_allow_user_ids: Vec<String>,
+    #[serde(default)]
+    pub mattermost_url: Option<String>,
+    #[serde(default)]
+    pub mattermost_token: Option<String>,
+    #[serde(default)]
+    pub mattermost_allow_user_ids: Vec<String>,
     #[serde(default)]
     pub voice_openai_api_key: Option<String>,
     #[serde(default = "default_voice_name")]
@@ -228,6 +235,15 @@ impl Config {
         )?;
         flatten_provider_section(
             root,
+            "mattermost",
+            &[
+                ("url", "mattermost_url"),
+                ("token", "mattermost_token"),
+                ("allow_user_ids", "mattermost_allow_user_ids"),
+            ],
+        )?;
+        flatten_provider_section(
+            root,
             "voice",
             &[
                 ("openai_api_key", "voice_openai_api_key"),
@@ -267,6 +283,11 @@ impl Config {
                 &assistant_root,
                 c.slack_app_token.as_deref(),
                 c.slack_bot_token.as_deref(),
+            )?;
+            validate_inline_mattermost_token_location(
+                &config_path,
+                &assistant_root,
+                c.mattermost_token.as_deref(),
             )?;
             validate_inline_voice_key_location(
                 &config_path,
@@ -373,6 +394,18 @@ impl Config {
 
     pub fn slack_bot_token(&self) -> Option<String> {
         configured_secret(self.slack_bot_token.as_deref(), SLACK_BOT_TOKEN_ENV)
+    }
+
+    pub fn mattermost_token(&self) -> Option<String> {
+        configured_secret(self.mattermost_token.as_deref(), MATTERMOST_TOKEN_ENV)
+    }
+
+    pub fn mattermost_url(&self) -> Option<String> {
+        self.mattermost_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
     }
 
     pub fn route_for_message(
@@ -550,6 +583,26 @@ impl Config {
                         bail!("slack.bot_token cannot be empty");
                     }
                 }
+                ChannelKind::Mattermost => {
+                    if self.mattermost_allow_user_ids.is_empty()
+                        || self
+                            .mattermost_allow_user_ids
+                            .iter()
+                            .any(|user| user.trim().is_empty())
+                    {
+                        bail!("set mattermost.allow_user_ids to explicit Mattermost user IDs");
+                    }
+                    if self.mattermost_url().is_none() {
+                        bail!("set mattermost.url to your Mattermost server URL");
+                    }
+                    if self
+                        .mattermost_token
+                        .as_deref()
+                        .is_some_and(|v| v.trim().is_empty())
+                    {
+                        bail!("mattermost.token cannot be empty");
+                    }
+                }
             }
         }
         self.agent_backend()?;
@@ -645,6 +698,22 @@ pub(crate) fn validate_inline_slack_token_location(
     {
         bail!(
             "config {} contains inline Slack tokens inside the Git-versioned assistant repository. Move the config outside the assistant or use SLACK_APP_TOKEN and SLACK_BOT_TOKEN.",
+            config_path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_inline_mattermost_token_location(
+    config_path: &Path,
+    assistant_root: &Path,
+    token: Option<&str>,
+) -> Result<()> {
+    if token.is_some_and(|token| !token.trim().is_empty())
+        && config_path.starts_with(assistant_root)
+    {
+        bail!(
+            "config {} contains an inline Mattermost token inside the Git-versioned assistant repository. Move the config outside the assistant or use MATTERMOST_TOKEN.",
             config_path.display()
         );
     }
@@ -781,6 +850,7 @@ pub enum ChannelKind {
     IMessage,
     Telegram,
     Slack,
+    Mattermost,
 }
 
 impl ChannelKind {
@@ -789,8 +859,9 @@ impl ChannelKind {
             "imessage" => Ok(Self::IMessage),
             "telegram" => Ok(Self::Telegram),
             "slack" => Ok(Self::Slack),
+            "mattermost" => Ok(Self::Mattermost),
             other => bail!(
-                "invalid channel {other:?}; expected \"imessage\", \"telegram\", or \"slack\""
+                "invalid channel {other:?}; expected \"imessage\", \"telegram\", \"slack\", or \"mattermost\""
             ),
         }
     }
@@ -800,6 +871,7 @@ impl ChannelKind {
             Self::IMessage => "imessage",
             Self::Telegram => "telegram",
             Self::Slack => "slack",
+            Self::Mattermost => "mattermost",
         }
     }
 }
@@ -908,6 +980,9 @@ mod tests {
             slack_app_token: None,
             slack_bot_token: None,
             slack_allow_user_ids: Vec::new(),
+            mattermost_url: None,
+            mattermost_token: None,
+            mattermost_allow_user_ids: Vec::new(),
             voice_openai_api_key: None,
             voice_name: DEFAULT_VOICE_NAME.to_string(),
             agent: "codex".to_string(),

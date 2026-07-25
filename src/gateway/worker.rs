@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::agent::{Request, RunError};
+use crate::channel::OutboundFile;
 use crate::history::{DeliveryStatus, OutboundMessage, OutboundOrigin};
 use crate::rehydration::{self, RehydrationPrompt};
 use crate::soul;
@@ -185,6 +186,17 @@ where
             return;
         }
     };
+
+    if !job.files.is_empty() {
+        let note = prepare_files(ctx, &job, &work_dir).await;
+        if !note.is_empty() {
+            job.text = if job.text.trim().is_empty() {
+                note
+            } else {
+                format!("{}\n\n{note}", job.text)
+            };
+        }
+    }
 
     let instructions = match soul::load(&work_dir) {
         Ok(instructions) => instructions,
@@ -388,11 +400,15 @@ where
                 ctx.audit
                     .backend_completed(job.row_id, &job.thread, job.backend, &out.reply),
             );
+            // Pull any [[attach: path]] markers out of the reply; the delivered
+            // and stored text is the reply without them.
+            let attachments = parse_attach_markers(&out.reply);
+            let reply = strip_attach_markers(&out.reply);
             let outbound = match ctx.history.lock().unwrap().record_outbound(
                 job.inbound_id,
                 OutboundOrigin::Backend,
                 Some(job.backend.as_str()),
-                &out.reply,
+                &reply,
             ) {
                 Ok(outbound) => outbound,
                 Err(error) => {
@@ -422,12 +438,23 @@ where
             let delivery = deliver_stored(ctx, &job, &outbound).await;
             if delivery.is_ok() {
                 info!("[{}] reply sent via {}", job.thread, ctx.channel.id());
+                if !attachments.is_empty() {
+                    let files = load_outbound_files(&work_dir, &attachments);
+                    if !files.is_empty() {
+                        if let Err(e) = ctx.channel.send_files(&job.target, &files).await {
+                            warn!("[{}] attachment upload failed: {e:#}", job.thread);
+                        }
+                    }
+                }
+                if let Err(e) = ctx.channel.finish_activity(&job.target, true).await {
+                    warn!("[{}] {} activity finish failed: {e}", job.thread, ctx.channel.id());
+                }
             }
             report_delivery(
                 ctx,
                 &job,
                 delivery,
-                &out.reply,
+                &reply,
                 "completed",
                 "deliver backend reply",
             );
@@ -573,6 +600,129 @@ async fn prepare_voice(ctx: &Ctx, job: &Job) -> std::result::Result<String, Voic
     Ok(transcript)
 }
 
+/// Largest agent-produced file Push will attach to a reply.
+const MAX_ATTACH_BYTES: usize = 20 * 1024 * 1024;
+/// Most attachments downloaded for a single inbound message.
+const MAX_INBOUND_FILES: usize = 10;
+
+/// Downloads the message's whitelisted attachments into `<work_dir>/inbox/` and
+/// returns a note listing their relative paths. The agent decides whether and
+/// how to use them; a per-file failure is skipped, not fatal.
+async fn prepare_files(ctx: &Ctx, job: &Job, work_dir: &str) -> String {
+    let inbox = std::path::Path::new(work_dir).join("inbox");
+    if let Err(error) = std::fs::create_dir_all(&inbox) {
+        warn!("[{}] inbox dir create failed: {error}", job.thread);
+        return String::new();
+    }
+    // Keep uploaded files out of the assistant's git repository.
+    let ignore = inbox.join(".gitignore");
+    if !ignore.exists() {
+        let _ = std::fs::write(&ignore, "*\n");
+    }
+    let mut lines = Vec::new();
+    for file in job.files.iter().take(MAX_INBOUND_FILES) {
+        let Some(name) = sanitize_filename(&file.filename) else {
+            continue;
+        };
+        let bytes = match ctx.channel.download_file(file).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    "[{}] attachment {:?} download failed: {error:#}",
+                    job.thread, file.filename
+                );
+                continue;
+            }
+        };
+        if let Err(error) = std::fs::write(inbox.join(&name), &bytes) {
+            warn!("[{}] attachment {name:?} write failed: {error}", job.thread);
+            continue;
+        }
+        lines.push(format!("- inbox/{name}"));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "The user attached the following file(s) in the working directory:\n{}",
+        lines.join("\n")
+    )
+}
+
+/// Reduces a channel-supplied filename to a safe base name inside `inbox/`.
+fn sanitize_filename(name: &str) -> Option<String> {
+    let base = std::path::Path::new(name).file_name()?.to_str()?;
+    (!base.is_empty() && base != "." && base != "..").then(|| base.to_string())
+}
+
+/// Extracts the paths from `[[attach: <path>]]` markers in the agent reply.
+fn parse_attach_markers(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[[attach:") {
+        let after = &rest[start + "[[attach:".len()..];
+        let Some(end) = after.find("]]") else {
+            break;
+        };
+        let path = after[..end].trim();
+        if !path.is_empty() {
+            paths.push(path.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    paths
+}
+
+/// Removes every `[[attach: …]]` marker from the reply text.
+fn strip_attach_markers(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[[attach:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "[[attach:".len()..];
+        match after.find("]]") {
+            Some(end) => rest = &after[end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Reads agent-produced files named by attach markers, refusing paths that
+/// escape the work directory or exceed the size cap.
+fn load_outbound_files(work_dir: &str, names: &[String]) -> Vec<OutboundFile> {
+    let Ok(root) = std::fs::canonicalize(work_dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for name in names {
+        let Ok(resolved) = std::fs::canonicalize(root.join(name)) else {
+            continue;
+        };
+        if !resolved.starts_with(&root) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&resolved) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_ATTACH_BYTES {
+            continue;
+        }
+        let Some(filename) = resolved.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        files.push(OutboundFile {
+            filename: filename.to_string(),
+            bytes,
+        });
+    }
+    files
+}
+
 /// Error and completion labels for one gateway-authored reply flow.
 struct ReplyLabels {
     record: &'static str,
@@ -600,6 +750,11 @@ async fn finish_run_with_gateway_reply(ctx: &Ctx, job: &Job, reply: &str, labels
         labels.completion,
         labels.deliver,
     );
+    // A failed, timed-out, or interrupted run still clears its in-progress
+    // signal, marking the message as not successfully answered.
+    if let Err(e) = ctx.channel.finish_activity(&job.target, false).await {
+        warn!("[{}] {} activity finish failed: {e}", job.thread, ctx.channel.id());
+    }
 }
 
 /// Audits `reply_sent` and completes the row when the reply reached the
@@ -944,5 +1099,57 @@ fn backend_request<'a>(
         work_dir,
         instructions,
         prompt,
+    }
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+
+    #[test]
+    fn parses_attach_markers_and_ignores_unclosed() {
+        assert_eq!(
+            parse_attach_markers("done [[attach: out.md]] and [[attach: dir/b.png ]]"),
+            vec!["out.md".to_string(), "dir/b.png".to_string()]
+        );
+        assert_eq!(parse_attach_markers("no markers"), Vec::<String>::new());
+        assert_eq!(parse_attach_markers("[[attach: unclosed"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn strips_attach_markers_from_reply_text() {
+        assert_eq!(
+            strip_attach_markers("Here you go. [[attach: out.md]]"),
+            "Here you go."
+        );
+        assert_eq!(strip_attach_markers("[[attach: only.md]]"), "");
+        assert_eq!(strip_attach_markers("plain text"), "plain text");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_paths_and_dot_names() {
+        assert_eq!(sanitize_filename("../../etc/passwd").as_deref(), Some("passwd"));
+        assert_eq!(sanitize_filename("dir/report.md").as_deref(), Some("report.md"));
+        assert_eq!(sanitize_filename(".."), None);
+        assert_eq!(sanitize_filename(""), None);
+    }
+
+    #[test]
+    fn load_outbound_files_reads_within_workdir_and_rejects_escapes() {
+        let dir = crate::test_support::temp_path("worker-outbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("out.md"), b"payload").unwrap();
+        let work_dir = dir.to_str().unwrap();
+
+        let files = load_outbound_files(work_dir, &["out.md".to_string()]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "out.md");
+        assert_eq!(files[0].bytes, b"payload");
+
+        // A traversal path resolves outside the work dir and is rejected.
+        assert!(load_outbound_files(work_dir, &["../out.md".to_string()]).is_empty());
+        // A missing file is skipped.
+        assert!(load_outbound_files(work_dir, &["nope.md".to_string()]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

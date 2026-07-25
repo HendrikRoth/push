@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 
 use crate::{channel::Channel, config, history, jobs};
-use config::{SLACK_APP_TOKEN_ENV, SLACK_BOT_TOKEN_ENV, TELEGRAM_BOT_TOKEN_ENV};
+use config::{
+    MATTERMOST_TOKEN_ENV, SLACK_APP_TOKEN_ENV, SLACK_BOT_TOKEN_ENV, TELEGRAM_BOT_TOKEN_ENV,
+};
 
 /// Fails fast with actionable messages when the environment is not ready.
 pub fn preflight(cfg: &config::Config) -> Result<()> {
@@ -73,6 +75,7 @@ fn run_checks(cfg: &config::Config) -> CheckReport {
                     config::ChannelKind::IMessage => check_imessage_db(cfg, &mut checks),
                     config::ChannelKind::Telegram => check_telegram_config(cfg, &mut checks),
                     config::ChannelKind::Slack => check_slack_config(cfg, &mut checks),
+                    config::ChannelKind::Mattermost => check_mattermost_config(cfg, &mut checks),
                 }
             }
         }
@@ -173,6 +176,7 @@ fn check_secret_config_permissions(cfg: &config::Config, checks: &mut Vec<Check>
         cfg.telegram_bot_token.as_deref(),
         cfg.slack_app_token.as_deref(),
         cfg.slack_bot_token.as_deref(),
+        cfg.mattermost_token.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -342,6 +346,28 @@ fn check_slack_config(cfg: &config::Config, checks: &mut Vec<Check>) {
                 format!("not configured. Set {environment} or the matching slack token without printing it."),
             ));
         }
+    }
+}
+
+fn check_mattermost_config(cfg: &config::Config, checks: &mut Vec<Check>) {
+    if cfg.mattermost_token().is_some() {
+        checks.push(Check::pass(
+            "Mattermost token",
+            format!("loaded from config or {MATTERMOST_TOKEN_ENV}"),
+        ));
+    } else {
+        checks.push(Check::fail(
+            "Mattermost token",
+            format!("not configured. Set {MATTERMOST_TOKEN_ENV} or mattermost.token without printing the token."),
+        ));
+    }
+    if cfg.mattermost_url().is_some() {
+        checks.push(Check::pass("Mattermost server URL", "mattermost.url is set"));
+    } else {
+        checks.push(Check::fail(
+            "Mattermost server URL",
+            "not configured. Set mattermost.url to your Mattermost server URL.",
+        ));
     }
 }
 

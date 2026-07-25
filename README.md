@@ -67,7 +67,7 @@ flowchart TD
 ## What it does
 
 - Runs on your Mac or Linux machine
-- Connects private iMessage, Telegram, and Slack chats
+- Connects private iMessage, Telegram, Slack, and Mattermost chats
 - Uses your existing Claude Code, Codex, or Pi setup
 - Keeps conversations and job history between restarts
 - Runs one-off or scheduled Markdown jobs
