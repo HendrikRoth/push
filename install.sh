@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="owainlewis/push"
+repo="${PUSH_REPO:-owainlewis/push}"
 bin_dir="${BIN_DIR:-$HOME/.local/bin}"
 
 need() {
